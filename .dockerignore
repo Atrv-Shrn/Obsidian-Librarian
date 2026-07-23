@@ -1,0 +1,39 @@
+# Keep the build context minimal — everything here is either rebuilt inside the image,
+# irrelevant to it, or a secret. A smaller context means a faster `docker build` handoff
+# and fewer spurious cache invalidations (a stray .pyc must not bust the COPY src layer).
+
+# Python build/test artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Secrets + local state (never bake these into an image)
+.env
+/data/
+
+# VCS / editor / OS / tooling
+.git/
+.gitignore
+.github/
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs and samples are not needed at build time. README.md is the exception —
+# pyproject.toml declares it as the package readme, so the build fails without it.
+docs/
+sample_vault/
+tests/
+Makefile
+docker-compose.yml
+LICENSE

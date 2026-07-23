@@ -1,0 +1,1 @@
+"""Skills package — markdown knowledge files loaded into the agent's system prompt."""

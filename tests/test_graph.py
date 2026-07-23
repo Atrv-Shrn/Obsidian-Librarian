@@ -1,0 +1,138 @@
+"""Tests for the dependency-free config + history-reconciliation helpers in the agent graph.
+
+We never build the real agent (that needs MCP servers + langgraph.prebuilt). Instead we drive
+``_reconcile_new_messages`` with a tiny fake agent exposing ``aget_state``, and ``_invoke_config``
+with monkeypatched observability hooks.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from obsidian_librarian.agent import graph
+
+
+class _Msg:
+    """Minimal stand-in for a LangChain message: identity = (type, content)."""
+
+    def __init__(self, type, content=""):
+        self.type = type
+        self.content = content
+
+
+class _FakeAgent:
+    """Exposes only ``aget_state``; returns ``SimpleNamespace(values={...})``."""
+
+    def __init__(self, messages, raise_on_state=False):
+        self._messages = messages
+        self._raise = raise_on_state
+
+    async def aget_state(self, cfg):
+        if self._raise:
+            raise RuntimeError("no checkpoint backend")
+        return SimpleNamespace(values={"messages": list(self._messages)})
+
+
+def _run(coro):
+    return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
+
+
+# --------------------------------------------------------------------------- _reconcile_new_messages
+
+
+def test_reconcile_empty_state_returns_full():
+    agent = _FakeAgent(messages=[])
+    msgs = [_Msg("human", "hi"), _Msg("ai", "hello")]
+    assert _run(graph._reconcile_new_messages(agent, msgs, "t")) is msgs
+
+
+def test_reconcile_aget_state_raises_propagates():
+    # A fresh thread returns empty state (no raise); a raise means the backend is broken.
+    # Propagate it rather than silently feeding duplicates into a partially-checkpointed thread.
+    agent = _FakeAgent(messages=[_Msg("ai", "x")], raise_on_state=True)
+    msgs = [_Msg("human", "hi")]
+    with pytest.raises(RuntimeError):
+        _run(graph._reconcile_new_messages(agent, msgs, "t"))
+
+
+def test_reconcile_drops_already_checkpointed_when_history_strips_tool_msgs():
+    # Chat clients resend only user/assistant turns — tool + tool-call noise is stripped.
+    # The checkpoint state carries the full turn-1 sequence (incl. the tool round), so a
+    # positional prefix match would misalign; content-membership dedup must still drop the
+    # resent human+ai pair and pass only the new "yes".
+    existing = [_Msg("human", "q"), _Msg("ai", "<toolcall>"), _Msg("tool", "result"), _Msg("ai", "plan")]
+    agent = _FakeAgent(messages=existing)
+    msgs = [_Msg("human", "q"), _Msg("ai", "plan"), _Msg("human", "yes")]
+    out = _run(graph._reconcile_new_messages(agent, msgs, "t"))
+    assert [m.content for m in out] == ["yes"]
+
+
+def test_reconcile_prefix_match_returns_suffix():
+    existing = [_Msg("human", "hi"), _Msg("ai", "hello")]
+    agent = _FakeAgent(messages=existing)
+    msgs = [_Msg("human", "hi"), _Msg("ai", "hello"), _Msg("human", "again?")]
+    out = _run(graph._reconcile_new_messages(agent, msgs, "t"))
+    assert len(out) == 1
+    assert out[0].content == "again?"
+
+
+def test_reconcile_no_overlap_returns_full():
+    # First message differs → n=0 → full list returned.
+    agent = _FakeAgent(messages=[_Msg("human", "different")])
+    msgs = [_Msg("human", "hi"), _Msg("ai", "hello")]
+    assert _run(graph._reconcile_new_messages(agent, msgs, "t")) is msgs
+
+
+def test_reconcile_partial_prefix_match():
+    existing = [_Msg("human", "hi"), _Msg("ai", "hello")]
+    agent = _FakeAgent(messages=existing)
+    # Diverges at index 1.
+    msgs = [_Msg("human", "hi"), _Msg("ai", "DIFFERENT"), _Msg("human", "q")]
+    out = _run(graph._reconcile_new_messages(agent, msgs, "t"))
+    assert len(out) == 2
+    assert out[0].content == "DIFFERENT"
+    assert out[1].content == "q"
+
+
+# --------------------------------------------------------------------------- _invoke_config
+
+
+def test_invoke_config_disabled_no_callbacks():
+    # No Langfuse keys set by the autouse fixture → langfuse_enabled() is False.
+    config, handler = graph._invoke_config(None)
+    assert handler is None
+    assert "callbacks" not in config
+    assert config["recursion_limit"] == 12
+    assert config["configurable"]["thread_id"] == "obsidian-librarian-default"
+
+
+def test_invoke_config_thread_id_override():
+    config, handler = graph._invoke_config("custom-thread")
+    assert config["configurable"]["thread_id"] == "custom-thread"
+    assert handler is None
+
+
+def test_invoke_config_enabled_attaches_handler(monkeypatch):
+    class _FakeHandler:
+        def get_trace_id(self):
+            return "trace-xyz"
+
+    monkeypatch.setattr(graph, "langfuse_enabled", lambda: True)
+    monkeypatch.setattr(graph, "get_langfuse_handler", lambda: _FakeHandler())
+
+    config, handler = graph._invoke_config("t")
+    assert handler is not None
+    assert handler.get_trace_id() == "trace-xyz"
+    assert config["callbacks"] == [handler]
+
+
+def test_invoke_config_enabled_but_handler_none_omits_callbacks(monkeypatch):
+    # langfuse enabled but get_langfuse_handler() returned None → no callbacks key.
+    monkeypatch.setattr(graph, "langfuse_enabled", lambda: True)
+    monkeypatch.setattr(graph, "get_langfuse_handler", lambda: None)
+    config, handler = graph._invoke_config("t")
+    assert handler is None
+    assert "callbacks" not in config

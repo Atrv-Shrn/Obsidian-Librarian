@@ -1,0 +1,36 @@
+services:
+  librarian:
+    build: .
+    image: obsidian-librarian:latest
+    container_name: obsidian-librarian
+    ports:
+      - "8000:8000"
+    volumes:
+      # HOST path of your vault → the container's /vault. Deliberately NOT named
+      # VAULT_PATH: that name is the *container-internal* mount point (see .env.example
+      # / config.py), and reusing it here made a copied .env resolve the host source to
+      # the literal "/vault" — an empty dir, so nothing indexed and every answer came
+      # back "not in the vault".
+      - ${HOST_VAULT_PATH:-./sample_vault}:/vault
+      - librarian-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-https://api.ollama.com/v1}
+      OLLAMA_LOCAL_BASE_URL: ${OLLAMA_LOCAL_BASE_URL:-http://127.0.0.1:11434}
+      GENERATION_MODEL: ${GENERATION_MODEL:-deepseek-v4-pro:cloud}
+      JUDGE_MODEL: ${JUDGE_MODEL:-glm-5.2:cloud}
+      OBSIDIAN_MCP_URL: ${OBSIDIAN_MCP_URL:-https://host.docker.internal:27124/mcp/}
+      OBSIDIAN_API_KEY: ${OBSIDIAN_API_KEY}
+      OBSIDIAN_TLS_INSECURE: ${OBSIDIAN_TLS_INSECURE:-true}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-15}
+      WRITE_CONFIRM: ${WRITE_CONFIRM:-true}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-}
+    restart: unless-stopped
+
+volumes:
+  librarian-data:
