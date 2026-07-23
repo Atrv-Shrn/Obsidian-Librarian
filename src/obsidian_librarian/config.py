@@ -10,10 +10,11 @@ Two runtime model layers (see SPEC.md, stack table):
   dense embedding model `nomic-embed-text`. Embeddings stay in-container; the vault
   never leaves the box. Used by our custom `NomicEmbedding` (a LlamaIndex
   `BaseEmbedding` subclass) and the Ragas embedding-based metrics.
-* **Ollama Cloud** (`OLLAMA_BASE_URL`, default `https://api.ollama.com/v1`) is reached via
+* **Ollama Cloud** (`OLLAMA_BASE_URL`, default `https://ollama.com`) is reached via
   `ChatOllama` (`langchain-ollama`): the cloud host goes in `base_url`, `OLLAMA_API_KEY`
-  rides as a bearer header in `client_kwargs`. Two distinct cloud models live here, on
-  purpose:
+  rides as a bearer header in `client_kwargs`. The host carries **no** `/v1` suffix —
+  ChatOllama uses the native ollama client (`{base_url}/api/chat`), and a `/v1` would make
+  that `/v1/api/chat` → 404. Two distinct cloud models live here, on purpose:
     - `GENERATION_MODEL` (default `deepseek-v4-pro:cloud`) — agent reasoning + RAG
       synthesis (the generator).
     - `JUDGE_MODEL` (default `glm-5.2:cloud`) — Ragas LLM-metric judge. Judge ≠
@@ -67,7 +68,11 @@ class Settings(BaseSettings):
     embed_request_timeout: float = 300.0
 
     # --- Ollama Cloud (LLM + judge) ---------------------------------------
-    ollama_base_url: str = "https://api.ollama.com/v1"
+    # Native Ollama API host. ChatOllama (langchain-ollama) uses the native ollama client, which
+    # appends ``/api/chat`` to this base — so it MUST NOT carry a ``/v1`` suffix (that is the
+    # OpenAI-compat path and yields a 404 on ``/v1/api/chat``). Our own OpenAI-compatible ``/v1``
+    # endpoint is a separate thing we expose; it is unrelated to how we call Ollama Cloud.
+    ollama_base_url: str = "https://ollama.com"
     ollama_api_key: Optional[str] = Field(
         default=None, description="Ollama Cloud API key (routes both deepseek + glm)."
     )

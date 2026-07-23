@@ -17,7 +17,7 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       OLLAMA_API_KEY: ${OLLAMA_API_KEY}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-https://api.ollama.com/v1}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-https://ollama.com}
       OLLAMA_LOCAL_BASE_URL: ${OLLAMA_LOCAL_BASE_URL:-http://127.0.0.1:11434}
       GENERATION_MODEL: ${GENERATION_MODEL:-deepseek-v4-pro:cloud}
       JUDGE_MODEL: ${JUDGE_MODEL:-glm-5.2:cloud}
