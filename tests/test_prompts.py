@@ -76,6 +76,7 @@ def test_prompt_has_grounding_verify_rule(monkeypatch):
     build_system_prompt.cache_clear()
     p = build_system_prompt().lower()
     assert "get_backlinks" in p and "get_note" in p
-    # The core rule: don't claim non-existence without verifying.
-    assert "does not exist" in p or "not exist" in p
+    # The core rule: don't claim non-existence without verifying; trust the authoritative signal.
+    assert "doesn't exist" in p or "does not exist" in p
+    assert "exists" in p  # points at get_backlinks' authoritative `exists` field
     assert "placeholder" in p  # the exact failure mode we saw

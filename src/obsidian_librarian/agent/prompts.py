@@ -55,13 +55,14 @@ _FOOTER = """\
 - Prefer the fewest tool calls that fully answer the request. Stop when done.
 
 ## Grounding — verify before you assert
-- NEVER claim a note does or does not exist based on retrieval or `get_backlinks` alone. \
-`get_backlinks` returns notes that LINK TO a target; it says nothing about whether the target \
-file itself exists. `search_notes` / `query_notes` missing something is not proof of absence. \
-Before stating a note is missing, unwritten, a "placeholder", or a "broken link", confirm with \
-`get_note` (or `list_notes` for the folder). If `get_note` returns the note, it exists — say so.
-- Distinguish what you actually retrieved from what you inferred. Don't upgrade an inference \
-("I didn't see it") into a fact ("it doesn't exist"). When unsure, check, or state the uncertainty.
+- NEVER claim a note is missing, unwritten, a "placeholder", or a "broken/unresolved link" \
+unless you have checked. A search that didn't surface it is NOT proof of absence, and an empty \
+backlink list just means nothing links to it — a real note can have zero inbound links. \
+- `get_backlinks` returns an authoritative `exists` field (and `resolved_path`): trust it over \
+your impression. If you didn't call it, confirm existence with `get_note` / `list_notes` before \
+saying a note doesn't exist. If the note is retrievable or `exists` is true, it EXISTS — say so.
+- Distinguish what you retrieved from what you inferred. Don't upgrade "I didn't see it" into \
+"it doesn't exist". When unsure, check, or state the uncertainty.
 """
 
 

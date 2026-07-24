@@ -85,38 +85,62 @@ def list_notes(path_prefix: Optional[str] = None) -> list[str]:
 
 
 @mcp.tool()
-def get_backlinks(path: str) -> list[str]:
-    """Return paths of notes that link to the given note (by title or filename).
+def get_backlinks(path: str) -> dict:
+    """Whether a note EXISTS, plus the notes that link to it.
 
-    Mirrors :func:`reader.compute_backlinks`: the indexer matches a wikilink's target against
-    the note's frontmatter ``title`` (defaulting to the stem) **and** its stem, so a note
-    ``bayes.md`` titled ``Bayesian Reasoning`` is backlinked by ``[[Bayesian Reasoning]]``.
-    Matching only the stem here would return an incomplete set that contradicts the
-    ``backlinks`` field the Qdrant payload carries, so we resolve the target note's title from
-    the vault snapshot and test link targets against it too.
+    ``path`` may be a full vault path, a filename, a bare note name, or a wikilink target —
+    e.g. ``"Embeddings"``, ``"Embeddings.md"``, or ``"RAG Pipeline Basics/Embeddings.md"``.
+
+    Returns::
+
+        {"target": <as asked>, "exists": bool, "resolved_path": <path|None>, "backlinks": [paths]}
+
+    ``exists`` is AUTHORITATIVE — it is the ground truth for whether the note is in the vault.
+    Do NOT infer that a note is missing/unwritten/a-placeholder from an empty ``backlinks`` list
+    or from a search that didn't surface it: a real note can simply have no inbound links. Only
+    ``exists == false`` means "no such note". The tool resolves bare names against each note's
+    frontmatter ``title`` (defaulting to the stem) **and** its stem, mirroring the indexer.
     """
     docs = _vault_docs()
-    target_stem = Path(path).stem
-    target_name = Path(path).name
+    q = path.strip()
+    q_stem = Path(q).stem
+    q_name = Path(q).name
+
+    resolved_path: Optional[str] = None
     target_title = ""
     for d in docs:
-        if d.metadata.get("file_path", "") == path:
-            target_title = str(d.metadata.get("title", "") or "")
+        fp = str(d.metadata.get("file_path", "") or "")
+        if not fp:
+            continue
+        title = str(d.metadata.get("title", "") or "")
+        if fp == q or Path(fp).name == q_name or Path(fp).stem == q_stem or (title and title == q):
+            resolved_path = fp
+            target_title = title
             break
+
+    # The identifiers a wikilink might use to point at this note.
+    targets = {q, q_stem, q_name}
+    if resolved_path:
+        targets |= {resolved_path, Path(resolved_path).name, Path(resolved_path).stem}
+    if target_title:
+        targets.add(target_title)
+    targets = {t for t in targets if t}
+
     back: list[str] = []
     for d in docs:
-        links = d.metadata.get("wikilinks", [])
-        for link in links:
+        for link in d.metadata.get("wikilinks", []):
             t = link.split("|")[0].split("#")[0].split("^")[0].strip()
-            if (
-                t == target_stem
-                or t == path
-                or t == target_name
-                or (bool(target_title) and t == target_title)
-            ):
-                back.append(d.metadata.get("file_path", ""))
+            if t in targets:
+                fp = str(d.metadata.get("file_path", "") or "")
+                if fp:
+                    back.append(fp)
                 break
-    return sorted(set(b for b in back if b))
+    return {
+        "target": path,
+        "exists": resolved_path is not None,
+        "resolved_path": resolved_path,
+        "backlinks": sorted(set(back)),
+    }
 
 
 @mcp.tool()

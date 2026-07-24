@@ -94,7 +94,9 @@ def test_get_backlinks_matches_frontmatter_title(monkeypatch):
     monkeypatch.setattr(rs, "load_vault", lambda: docs)
     rs._reset_vault_docs_cache()
 
-    back = rs.get_backlinks("bayes.md")
+    res = rs.get_backlinks("bayes.md")
+    assert res["exists"] is True and res["resolved_path"] == "bayes.md"
+    back = res["backlinks"]
     # Both the title-linker and the stem-linker must surface; the unrelated note must not.
     assert "priors.md" in back
     assert "notes.md" in back
@@ -111,8 +113,36 @@ def test_get_backlinks_still_matches_when_no_frontmatter_title(monkeypatch):
     monkeypatch.setattr(rs, "load_vault", lambda: docs)
     rs._reset_vault_docs_cache()
 
-    back = rs.get_backlinks("bayes.md")
-    assert back == ["notes.md"]
+    res = rs.get_backlinks("bayes.md")
+    assert res["exists"] is True
+    assert res["backlinks"] == ["notes.md"]
+
+
+def test_get_backlinks_resolves_bare_name_and_reports_existence(monkeypatch):
+    """The exact bug from stress testing: asked for backlinks of 'Embeddings' (a bare name in a
+    subfolder), the agent claimed the note didn't exist. get_backlinks must resolve the bare name
+    to its real path and report exists=True, so the agent can't hallucinate a missing note."""
+    docs = [
+        _doc("RAG Pipeline Basics/Embeddings.md", "Embeddings", []),  # exists, zero inbound links
+        _doc("RAG Pipeline Basics/What is RAG.md", "What is RAG", ["Embeddings"]),
+    ]
+    monkeypatch.setattr(rs, "load_vault", lambda: docs)
+    rs._reset_vault_docs_cache()
+
+    res = rs.get_backlinks("Embeddings")  # bare name, no path, no .md
+    assert res["exists"] is True
+    assert res["resolved_path"] == "RAG Pipeline Basics/Embeddings.md"
+    assert res["backlinks"] == ["RAG Pipeline Basics/What is RAG.md"]
+
+
+def test_get_backlinks_reports_nonexistent(monkeypatch):
+    docs = [_doc("a.md", "A", ["Ghost"])]  # links to a note that isn't in the vault
+    monkeypatch.setattr(rs, "load_vault", lambda: docs)
+    rs._reset_vault_docs_cache()
+    res = rs.get_backlinks("Ghost")
+    assert res["exists"] is False and res["resolved_path"] is None
+    # Even a non-existent target can have inbound links pointing at the broken wikilink.
+    assert res["backlinks"] == ["a.md"]
 
 
 # --------------------------------------------------------------------------- reindex resets cache
