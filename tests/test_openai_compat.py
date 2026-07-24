@@ -319,3 +319,53 @@ def test_probe_returns_error_name_not_traceback(monkeypatch):
 
     monkeypatch.setattr(httpx, "get", _boom)
     assert oc._probe_qdrant() == "ConnectError"
+
+
+# --------------------------------------------------------------------------- content parts
+#
+# Regression guard for the Copilot "Connection error": Obsidian Copilot sends message content
+# as an OpenAI content-parts LIST (it injects the active note as a text part), not a string.
+# Declaring content as `str` made pydantic 422 the whole request. Accept both shapes.
+
+
+def test_content_parts_list_accepted_and_flattened():
+    m = ChatMessage(
+        role="user",
+        content=[{"type": "text", "text": "<active_note>ctx</active_note>\n\nhi"}],
+    )
+    assert isinstance(m.content, list)
+    out = _to_lc_messages([m])
+    assert out[0].content == "<active_note>ctx</active_note>\n\nhi"
+
+
+def test_content_parts_multiple_text_parts_concatenate():
+    from obsidian_librarian.api.openai_compat import _content_to_str
+
+    assert _content_to_str([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]) == "ab"
+
+
+def test_content_parts_non_text_parts_ignored():
+    from obsidian_librarian.api.openai_compat import _content_to_str
+
+    # image/audio parts are dropped (agent is text-only); text survives.
+    mixed = [{"type": "image_url", "image_url": {"url": "x"}}, {"type": "text", "text": "keep"}]
+    assert _content_to_str(mixed) == "keep"
+
+
+def test_content_plain_string_and_none_still_work():
+    from obsidian_librarian.api.openai_compat import _content_to_str
+
+    assert _content_to_str("plain") == "plain"
+    assert _content_to_str(None) == ""
+
+
+def test_thread_id_stable_with_content_parts():
+    # The opener hash must flatten parts too, else it would hash a list repr and could differ
+    # from the same conversation resent as a string.
+    req_list = ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content=[{"type": "text", "text": "hello world"}])]
+    )
+    req_str = ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content="hello world")]
+    )
+    assert _thread_id(req_list) == _thread_id(req_str)

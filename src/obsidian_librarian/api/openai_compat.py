@@ -74,14 +74,44 @@ _configure_cors(app)
 
 
 class ChatMessage(BaseModel):
+    # ``content`` is a str OR a list of "content parts" OR null. The OpenAI Chat Completions
+    # spec allows content to be an array of typed parts (``[{"type":"text","text":"..."}]``),
+    # and real clients use it: Obsidian Copilot injects the active note as a text part, so it
+    # sends ``content`` as a list, not a string. Declaring ``str`` only made pydantic 422 the
+    # whole request ("Input should be a valid string"), which the client surfaced as a bare
+    # "Connection error". Accept both shapes here and flatten to text in ``_content_to_str``.
     role: str
-    content: str | None = ""
+    content: str | List[Dict[str, Any]] | None = ""
     name: Optional[str] = None
     # OpenAI assistant messages may carry tool_calls; tool messages must reference the
     # call they answer. Without these fields we'd silently drop tool-call continuity on
     # a resent history (pydantic v2 ignores extras), corrupting multi-turn tool flows.
     tool_call_id: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
+
+
+def _content_to_str(content: Any) -> str:
+    """Flatten OpenAI message content to a plain string.
+
+    Content is either a string, ``None``, or a list of typed parts. We only consume text, so
+    for the list form we concatenate the ``text`` of every ``{"type": "text", ...}`` part and
+    ignore non-text parts (images/audio) — the agent is text-only. A bare string passes through;
+    ``None`` becomes ``""``.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for p in content:
+            if isinstance(p, dict):
+                if p.get("type", "text") == "text" and isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts)
+    return str(content)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -107,7 +137,7 @@ def _to_lc_messages(msgs: List[ChatMessage]) -> list:
 
     out: list = []
     for m in msgs:
-        c = m.content or ""
+        c = _content_to_str(m.content)
         if m.role == "system":
             out.append(SystemMessage(content=c))
         elif m.role == "assistant":
@@ -160,7 +190,7 @@ def _thread_id(req: ChatCompletionRequest, conversation_id: Optional[str] = None
     s = get_settings()
     if conversation_id:
         return hashlib.sha1(f"conv::{conversation_id}".encode("utf-8")).hexdigest()[:16]
-    opener = next((m.content for m in req.messages if m.role == "user"), "") or ""
+    opener = _content_to_str(next((m.content for m in req.messages if m.role == "user"), ""))
     if not opener:
         return s.api_default_thread_id
     key = f"{req.user or ''}::{opener}"
