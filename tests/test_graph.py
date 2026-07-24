@@ -136,3 +136,33 @@ def test_invoke_config_enabled_but_handler_none_omits_callbacks(monkeypatch):
     config, handler = graph._invoke_config("t")
     assert handler is None
     assert "callbacks" not in config
+
+# --------------------------------------------------------------------------- list-content keys
+#
+# Regression guard for the "[stream error]" a couple of turns into a tool-using conversation:
+# LangChain stores tool-call / content-block messages with a LIST content, which is unhashable,
+# so Counter(key(m) ...) raised TypeError: unhashable type: 'list'. key() must normalize.
+
+
+def test_reconcile_handles_list_content_in_checkpoint():
+    # An AI message whose content is a list of content blocks (as tool-using turns produce).
+    existing = [
+        _Msg("human", "question"),
+        _Msg("ai", [{"type": "text", "text": "thinking"}, {"type": "tool_use", "name": "search"}]),
+    ]
+    agent = _FakeAgent(messages=existing)
+    # A fresh user turn resent as a string; must not crash on the unhashable checkpoint entry.
+    msgs = [_Msg("human", "question"), _Msg("human", "follow-up")]
+    out = _run(graph._reconcile_new_messages(agent, msgs, "t"))
+    # The already-seen "question" is dropped; the genuinely new "follow-up" survives.
+    assert [m.content for m in out] == ["follow-up"]
+
+
+def test_reconcile_list_content_message_dedups_against_itself():
+    # Same list-content message on both sides must dedup one-for-one (stable repr key).
+    blocks = [{"type": "text", "text": "x"}]
+    existing = [_Msg("ai", blocks)]
+    agent = _FakeAgent(messages=existing)
+    msgs = [_Msg("ai", list(blocks))]  # equal-by-value list content
+    out = _run(graph._reconcile_new_messages(agent, msgs, "t"))
+    assert out == []

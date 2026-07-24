@@ -217,7 +217,17 @@ async def _reconcile_new_messages(agent, messages: list, thread_id: str) -> list
     from collections import Counter
 
     def key(m: Any) -> tuple:
-        return (m.type, getattr(m, "content", ""))
+        # ``content`` is not always a string: LangChain stores tool-call / content-block
+        # messages with a LIST content (e.g. ``[{"type": "text", ...}, {"type": "tool_use", ...}]``),
+        # and a list is unhashable → ``Counter`` blew up with ``TypeError: unhashable type:
+        # 'list'`` once a prior turn's tool-using AI message landed in the checkpoint. That
+        # surfaced as a "[stream error]" a couple of turns into any conversation where the agent
+        # called a tool. Normalize non-string content to a stable string so the key is hashable;
+        # a deterministic ``repr`` is enough here (we only need equality within one reconcile).
+        c = getattr(m, "content", "")
+        if not isinstance(c, str):
+            c = repr(c)
+        return (m.type, c)
 
     # Count existing messages by key so duplicates dedup one-for-one rather than all-or-none.
     remaining = Counter(key(m) for m in existing)

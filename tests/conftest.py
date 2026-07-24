@@ -186,7 +186,14 @@ def _isolate_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_PATH", str(data))
     monkeypatch.setenv("SQLITE_PATH", str(data / "librarian.db"))
 
+    # Stop pydantic-settings from reading a developer's real ``.env`` from the repo root. Once a
+    # working ``.env`` lives next to the code (it does now — we run the container from here), tests
+    # that assert clean defaults (e.g. langfuse keys unset) would otherwise pick up real secrets and
+    # fail. Point ``env_file`` at a path that cannot exist so only monkeypatched env vars are read.
+    from obsidian_librarian import config as _config
     from obsidian_librarian.config import reset_settings_cache
+
+    monkeypatch.setitem(_config.Settings.model_config, "env_file", str(tmp_path / "no.env"))
 
     reset_settings_cache()
     _clear_lru_singletons()
