@@ -67,3 +67,15 @@ def test_custom_marker_is_substituted(monkeypatch):
     assert custom in p
     # The default marker must not leak through when a custom one is set.
     assert "[PENDING_WRITE]" not in p
+
+def test_prompt_has_grounding_verify_rule(monkeypatch):
+    # The agent once claimed a note "doesn't exist" from get_backlinks alone (it existed).
+    # The system prompt must instruct verifying existence with get_note before asserting absence.
+    from obsidian_librarian.agent.prompts import build_system_prompt
+
+    build_system_prompt.cache_clear()
+    p = build_system_prompt().lower()
+    assert "get_backlinks" in p and "get_note" in p
+    # The core rule: don't claim non-existence without verifying.
+    assert "does not exist" in p or "not exist" in p
+    assert "placeholder" in p  # the exact failure mode we saw
