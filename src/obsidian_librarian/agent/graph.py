@@ -242,6 +242,60 @@ async def _reconcile_new_messages(agent, messages: list, thread_id: str) -> list
     return messages if len(out) == len(messages) else out
 
 
+async def _repair_dangling_tool_calls(agent, thread_id: str) -> int:
+    """Complete any checkpointed tool_calls that never received a ToolMessage. Returns count.
+
+    If a turn errors *after* the model emits an AIMessage with tool_calls but *before* the
+    tools node writes the results (e.g. an MCP ``ConnectError`` while Obsidian is flapping, or
+    a recursion-limit abort), the checkpoint is left with **dangling** tool_calls. On the next
+    turn LangGraph reloads that state and ``create_react_agent``'s ``_validate_chat_history``
+    raises ``Found AIMessages with tool_calls that do not have a corresponding ToolMessage`` —
+    which 500s **every** subsequent message on that ``thread_id``. Because the thread id is
+    derived from the conversation, one transient hiccup poisons that chat permanently.
+
+    We repair it by appending a synthetic *error* ToolMessage for each unanswered tool_call, so
+    the history validates and the model simply sees "that tool failed" and proceeds. Appended
+    via ``aupdate_state`` (the ``add_messages`` reducer), so they land right after the dangling
+    AIMessage and before this turn's new input.
+    """
+    from langchain_core.messages import ToolMessage
+
+    cfg = {"configurable": {"thread_id": thread_id}}
+    state = await agent.aget_state(cfg)
+    messages = list(state.values.get("messages", []))
+    if not messages:
+        return 0
+    answered = {
+        m.tool_call_id
+        for m in messages
+        if getattr(m, "type", None) == "tool" and getattr(m, "tool_call_id", None)
+    }
+    repairs = []
+    for m in messages:
+        for tc in getattr(m, "tool_calls", None) or []:
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            if tc_id and tc_id not in answered:
+                repairs.append(
+                    ToolMessage(
+                        content=(
+                            "Error: this tool call did not complete because the previous turn "
+                            "was interrupted. Disregard it and continue."
+                        ),
+                        tool_call_id=tc_id,
+                        status="error",
+                    )
+                )
+                answered.add(tc_id)  # never synthesize two results for the same id
+    if repairs:
+        log.warning(
+            "Repaired %d dangling tool call(s) on thread %s (poisoned checkpoint).",
+            len(repairs),
+            thread_id,
+        )
+        await agent.aupdate_state(cfg, {"messages": repairs})
+    return len(repairs)
+
+
 async def ainvoke(messages: list, thread_id: Optional[str] = None) -> dict:
     """Run one agent turn. ``messages`` is a full LangChain message list (history resent).
 
@@ -250,6 +304,7 @@ async def ainvoke(messages: list, thread_id: Optional[str] = None) -> dict:
     """
     agent = await build_agent()
     tid = thread_id or get_settings().api_default_thread_id
+    await _repair_dangling_tool_calls(agent, tid)
     new_msgs = await _reconcile_new_messages(agent, messages, tid)
     config, handler = _invoke_config(thread_id)
     result = await agent.ainvoke({"messages": new_msgs}, config=config)
@@ -265,6 +320,7 @@ async def astream(messages: list, thread_id: Optional[str] = None):
     """Stream agent events for one turn (used by the SSE FastAPI layer)."""
     agent = await build_agent()
     tid = thread_id or get_settings().api_default_thread_id
+    await _repair_dangling_tool_calls(agent, tid)
     new_msgs = await _reconcile_new_messages(agent, messages, tid)
     async for event in agent.astream_events(
         {"messages": new_msgs}, config=_invoke_config(thread_id)[0], version="v2"

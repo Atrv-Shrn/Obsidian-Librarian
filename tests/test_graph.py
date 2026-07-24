@@ -18,22 +18,32 @@ from obsidian_librarian.agent import graph
 class _Msg:
     """Minimal stand-in for a LangChain message: identity = (type, content)."""
 
-    def __init__(self, type, content=""):
+    def __init__(self, type, content="", tool_calls=None, tool_call_id=None):
         self.type = type
         self.content = content
+        if tool_calls is not None:
+            self.tool_calls = tool_calls
+        if tool_call_id is not None:
+            self.tool_call_id = tool_call_id
 
 
 class _FakeAgent:
-    """Exposes only ``aget_state``; returns ``SimpleNamespace(values={...})``."""
+    """Exposes ``aget_state`` + ``aupdate_state``; returns ``SimpleNamespace(values={...})``."""
 
     def __init__(self, messages, raise_on_state=False):
         self._messages = messages
         self._raise = raise_on_state
+        self.updates = []  # records aupdate_state calls (for the repair test)
 
     async def aget_state(self, cfg):
         if self._raise:
             raise RuntimeError("no checkpoint backend")
         return SimpleNamespace(values={"messages": list(self._messages)})
+
+    async def aupdate_state(self, cfg, values):
+        # Mimic the add_messages reducer: append.
+        self.updates.append(values)
+        self._messages = list(self._messages) + list(values.get("messages", []))
 
 
 def _run(coro):
@@ -166,3 +176,61 @@ def test_reconcile_list_content_message_dedups_against_itself():
     msgs = [_Msg("ai", list(blocks))]  # equal-by-value list content
     out = _run(graph._reconcile_new_messages(agent, msgs, "t"))
     assert out == []
+
+
+# --------------------------------------------------------------------------- poisoned checkpoint
+#
+# Regression guard for the poisoned-checkpoint bug: a turn that errors after the model emits
+# tool_calls but before ToolMessages are written leaves the checkpoint with dangling tool_calls,
+# and every later turn on that thread_id 500s with "Found AIMessages with tool_calls that do not
+# have a corresponding ToolMessage". _repair_dangling_tool_calls completes them with error
+# ToolMessages so the thread is usable again.
+
+
+def test_repair_appends_toolmessage_for_dangling_call():
+    # AIMessage with a tool_call, NO following ToolMessage -> poisoned.
+    existing = [
+        _Msg("human", "q"),
+        _Msg("ai", "", tool_calls=[{"id": "call_x", "name": "search", "args": {}}]),
+    ]
+    agent = _FakeAgent(messages=existing)
+    n = _run(graph._repair_dangling_tool_calls(agent, "t"))
+    assert n == 1
+    assert len(agent.updates) == 1
+    appended = agent.updates[0]["messages"]
+    assert len(appended) == 1
+    tm = appended[0]
+    assert tm.type == "tool" and tm.tool_call_id == "call_x"
+    assert getattr(tm, "status", None) == "error"
+
+
+def test_repair_noop_when_all_calls_answered():
+    existing = [
+        _Msg("ai", "", tool_calls=[{"id": "call_x", "name": "search", "args": {}}]),
+        _Msg("tool", "result", tool_call_id="call_x"),
+    ]
+    agent = _FakeAgent(messages=existing)
+    n = _run(graph._repair_dangling_tool_calls(agent, "t"))
+    assert n == 0
+    assert agent.updates == []
+
+
+def test_repair_noop_on_empty_or_plain_history():
+    assert _run(graph._repair_dangling_tool_calls(_FakeAgent(messages=[]), "t")) == 0
+    plain = _FakeAgent(messages=[_Msg("human", "hi"), _Msg("ai", "hello")])
+    assert _run(graph._repair_dangling_tool_calls(plain, "t")) == 0
+    assert plain.updates == []
+
+
+def test_repair_multiple_dangling_calls_one_message_each():
+    existing = [
+        _Msg("ai", "", tool_calls=[
+            {"id": "a", "name": "search", "args": {}},
+            {"id": "b", "name": "get_note", "args": {}},
+        ]),
+        _Msg("tool", "answered", tool_call_id="a"),  # only 'a' answered
+    ]
+    agent = _FakeAgent(messages=existing)
+    n = _run(graph._repair_dangling_tool_calls(agent, "t"))
+    assert n == 1  # only 'b' was dangling
+    assert agent.updates[0]["messages"][0].tool_call_id == "b"
