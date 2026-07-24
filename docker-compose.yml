@@ -15,6 +15,15 @@ services:
       - librarian-data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Load the WHOLE .env into the container so every setting config.py understands actually
+    # takes effect. Without this, only the vars explicitly listed under `environment:` below
+    # reached the app, so e.g. RECURSION_LIMIT / CHUNK_SIZE / RERANK_TOP_K set in .env were
+    # silently ignored (the image doesn't ship .env — it's .dockerignore'd). `required: false`
+    # keeps the no-.env sample_vault flow working. The `environment:` block stays for graceful
+    # defaults when a var is absent from .env.
+    env_file:
+      - path: .env
+        required: false
     environment:
       OLLAMA_API_KEY: ${OLLAMA_API_KEY}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-https://ollama.com}

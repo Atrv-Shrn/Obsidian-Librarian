@@ -105,7 +105,7 @@ def test_invoke_config_disabled_no_callbacks():
     config, handler = graph._invoke_config(None)
     assert handler is None
     assert "callbacks" not in config
-    assert config["recursion_limit"] == 12
+    assert config["recursion_limit"] == 30
     assert config["configurable"]["thread_id"] == "obsidian-librarian-default"
 
 

@@ -23,7 +23,7 @@ def test_defaults_when_env_unset(monkeypatch):
     assert s.rerank_top_k == 6
     assert s.write_confirm is True
     assert s.pending_write_marker == "[PENDING_WRITE]"
-    assert s.recursion_limit == 12
+    assert s.recursion_limit == 30
     assert s.api_default_thread_id == "obsidian-librarian-default"
     assert s.langfuse_public_key is None
     assert s.langfuse_secret_key is None

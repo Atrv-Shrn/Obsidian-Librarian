@@ -114,7 +114,11 @@ class Settings(BaseSettings):
     rag_mcp_path: str = "/mcp"
 
     # --- Agent -------------------------------------------------------------
-    recursion_limit: int = 12  # hard guard against infinite tool loops
+    # Hard guard against infinite tool loops. 30, not 12: a legit multi-step write (e.g.
+    # "duplicate this note, rename it, rewrite the body") spends several laps — read, copy,
+    # re-read, patch — and 12 tripped LangGraph's limit mid-task, returning the confusing
+    # "Sorry, need more steps to process this request." even though the writes had landed.
+    recursion_limit: int = 30
     write_confirm: bool = True  # propose-then-confirm before any vault write
     pending_write_marker: str = "[PENDING_WRITE]"
 
