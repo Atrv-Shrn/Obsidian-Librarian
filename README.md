@@ -1,87 +1,141 @@
 # Obsidian-Librarian
 
-A personal AI librarian for your [Obsidian](https://obsidian.md) vault — a **read-only
-RAG pipeline** (LlamaIndex + Qdrant + Redis + in-process FastEmbed embeddings) that turns your
-notes into grounded answers, and a **LangGraph agent** (deepseek via Ollama Cloud) that
-reasons over those tools, talks to you, and controls the vault — create, edit, delete
-notes — through the Obsidian Local REST API plugin. **Ships as one Docker container.**
+A personal AI librarian for your [Obsidian](https://obsidian.md) vault.
 
-* Spec: [`docs/SPEC.md`](docs/SPEC.md) · Living state: [`docs/PRD.md`](docs/PRD.md)
-* The pipeline **never writes**; the agent does **all** writing.
-* Two seams: **MCP** (agent ↔ RAG-MCP read + Obsidian plugin write) and **FastAPI**
-  (you ↔ agent, OpenAI-compatible `:8000/v1`).
+It has two halves. A **read-only RAG pipeline** turns your notes into grounded answers — parse,
+chunk, embed, hybrid-retrieve, rerank, generate. A **LangGraph agent** sits on top of that,
+talks to you in any OpenAI-compatible chat client, and can create, edit and delete notes through
+the Obsidian Local REST API plugin — always proposing a write first and waiting for your "yes".
+
+Everything ships as **one Docker container**. Qdrant, Redis, the embedding models and both
+servers run inside it; the only things you bring are your vault and an API key.
+
+```
+you ──▶ chat client ──▶ :8000/v1 ──▶ agent ──┬──▶ RAG-MCP  ──▶ Qdrant + Redis ──▶ your notes
+                                              └──▶ Obsidian plugin MCP ──▶ writes (after you confirm)
+```
+
+- Architecture: [`docs/SPEC.md`](docs/SPEC.md) · Project state: [`docs/PRD.md`](docs/PRD.md)
+- The pipeline **never writes**. The agent does all writing, and only after you confirm.
+
+---
+
+## Table of contents
+
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Using it](#using-it)
+- [Connecting a chat client](#connecting-a-chat-client)
+- [Security](#security)
+- [Configuration](#configuration)
+- [Evaluation](#evaluation)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
+
+## How it works
+
+**Retrieval** is hybrid. Every chunk gets a dense vector (`nomic-embed-text-v1.5`, run in-process
+via FastEmbed — no model server) and a sparse BM25 vector. Qdrant stores both per point and fuses
+the two ranked lists server-side with Reciprocal Rank Fusion, so semantic similarity and exact
+keyword matches both count. A cross-encoder then reranks the shortlist, because first-stage
+retrieval optimises recall and reranking fixes ordering.
+
+**Three models, three jobs.** `nomic-embed-text-v1.5` embeds (local, free, your notes never leave
+the machine). `deepseek-v4-pro:cloud` generates. `glm-5.2:cloud` judges during evals — a different
+model from the generator on purpose, so it never grades its own output.
+
+**Writes are propose-then-confirm.** The agent replies with a `[PENDING_WRITE]` marker and a plan;
+nothing touches disk until you reply "yes". Deletes honour Obsidian's own trash setting.
+
+**Storage.** Qdrant holds vectors, Redis holds raw note text plus a content-hash set that skips
+re-embedding unchanged notes, SQLite holds sync watermarks and agent conversation state. All of it
+lives in one Docker volume.
+
+---
+
+## Requirements
+
+| | |
+|---|---|
+| **Docker Desktop** or Docker Engine | Everything else ships in the image |
+| **Ollama Cloud API key** | Required to *ask questions*. Indexing and retrieval work without one |
+| **Obsidian + Local REST API plugin** | Only if you want the agent to write. [Plugin docs](https://coddingtonbear.github.io/obsidian-local-rest-api/) |
+| **Langfuse keys** | Optional, for agent tracing |
+
+Roughly 2 GB of disk for the image, plus ~400 MB of models downloaded on first run.
+
+---
 
 ## Installation
 
-### 1. Prerequisites
-
-- **Docker Desktop** (or Docker Engine) — running. Everything else ships in the image.
-- An **Ollama Cloud API key** — needed for generation and the eval judge. Indexing and
-  retrieval work without one; asking questions does not.
-- *(writes only)* **Obsidian** running with the
-  [Local REST API plugin](https://coddingtonbear.github.io/obsidian-local-rest-api/) enabled,
-  and its bearer token.
-
-### 2. Get the code
+### 1. Get the code
 
 ```bash
 git clone https://github.com/Atrv-Shrn/Obsidian-Librarian.git
 cd Obsidian-Librarian
 ```
 
-### 3. Configure
+### 2. Configure
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`. For a first run you only need these:
+For a first run you only need these three lines in `.env`:
 
 ```bash
-OLLAMA_API_KEY=sk-...                      # required to ask questions
-HOST_VAULT_PATH=/absolute/path/to/Vault    # your vault ON THE HOST
-OBSIDIAN_API_KEY=...                       # only if you want the agent to write
+OLLAMA_API_KEY=sk-...                       # required to ask questions
+HOST_VAULT_PATH=/absolute/path/to/Vault     # your vault, ON THE HOST
+OBSIDIAN_API_KEY=...                        # only if you want writes
 ```
 
-> [!important] `HOST_VAULT_PATH` vs `VAULT_PATH` — they are not the same thing
-> `HOST_VAULT_PATH` is the folder **on your machine** that gets bind-mounted into the
-> container. `VAULT_PATH` (`/vault`) is the path **inside** the container — leave it alone.
+> [!IMPORTANT]
+> **`HOST_VAULT_PATH` and `VAULT_PATH` are different things.**
+> `HOST_VAULT_PATH` is the folder on *your machine* that gets bind-mounted in.
+> `VAULT_PATH` (`/vault`) is the path *inside* the container — leave it alone.
+>
 > Setting `VAULT_PATH` to a host path mounts an empty directory: the index comes up with zero
 > notes and every answer is *"I don't have enough in the vault."*
 >
-> Leave `HOST_VAULT_PATH` unset to run against the bundled `sample_vault/` — recommended for
-> your first run.
+> Leave `HOST_VAULT_PATH` unset to run against the bundled `sample_vault/`. **Recommended for
+> your first run** — it lets you watch the whole thing work before pointing it at real notes.
 
-### 4. Build and start
+### 3. Build and start
 
 ```bash
-docker compose build      # first build is slow: it downloads Qdrant and ~250 MB of wheels
+docker compose build      # first build downloads Qdrant + ~250 MB of wheels
 docker compose up -d
 ```
 
-On **first** start the container downloads the FastEmbed ONNX models (nomic dense ~133 MB,
-BM25 sparse, cross-encoder rerank) into `/data`, then indexes your vault. Expect a few minutes
-before it answers. Watch it happen:
+On first start the container downloads the FastEmbed ONNX models (~133 MB dense, plus BM25 and
+the cross-encoder) into its volume, then indexes your vault. Give it a few minutes.
 
 ```bash
 docker compose logs -f
 ```
 
-### 5. Verify
+### 4. Verify
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-A healthy stack returns `200` and:
+A healthy stack returns `200`:
 
 ```json
 {"status":"ok","model":"deepseek-v4-pro:cloud","obsidian_writes":false,
  "write_confirm":true,"checks":{"qdrant":{"ok":true},"redis":{"ok":true}}}
 ```
 
-If a dependency is down you get **503** and `"status":"degraded"` with the culprit named under
-`checks`. `docker ps` also shows `(healthy)` / `(unhealthy)`. To see the individual services:
+`obsidian_writes:false` is expected unless Obsidian is running with the plugin enabled — see
+[writes](#enabling-writes). A dependency being down gives `503` and `"status":"degraded"` with the
+culprit named under `checks`.
+
+Check the individual services:
 
 ```bash
 docker exec obsidian-librarian supervisorctl status
@@ -89,118 +143,255 @@ docker exec obsidian-librarian supervisorctl status
 
 All five of `qdrant`, `redis`, `rag-mcp`, `agent-api`, `vault-sync` should be `RUNNING`.
 
-### 6. Use it
+### 5. Ask it something
 
 ```bash
-# One-shot grounded answer from the RAG pipeline (no agent)
 docker exec -it obsidian-librarian librarian query "What is Bayes' Theorem?"
+```
+
+If that returns a grounded answer with `[[wikilink]]` citations, you're done.
+
+### Enabling writes
+
+Writes need Obsidian **open** with the Local REST API plugin enabled, and `OBSIDIAN_API_KEY` set
+to the plugin's bearer token.
+
+> [!IMPORTANT]
+> **Start Obsidian before the container**, or restart the agent afterwards:
+> ```bash
+> docker exec obsidian-librarian supervisorctl restart agent-api
+> ```
+> The agent probes the plugin once when it first builds and caches the result. If Obsidian wasn't
+> reachable then, it runs read-only until restarted — `/health` will keep saying
+> `"obsidian_writes": false` no matter how long you wait.
+
+---
+
+## Using it
+
+```bash
+# One-shot grounded answer from the RAG pipeline (no agent, no tools)
+docker exec -it obsidian-librarian librarian query "How does hybrid search work?"
+
+# Ranked chunks without generation — useful for debugging retrieval
+docker exec -it obsidian-librarian librarian search "reranking"
 
 # Interactive agent session (reads + propose-then-confirm writes)
 docker exec -it obsidian-librarian librarian chat
 
-# Force a re-index
+# Re-index now instead of waiting for the scheduler
 docker exec -it obsidian-librarian librarian sync
+
+# Show resolved config (secrets masked)
+docker exec -it obsidian-librarian librarian info
 ```
 
-Or point a chat client at `http://localhost:8000/v1` — Obsidian Copilot, Open WebUI, or
-anything that speaks the OpenAI Chat Completions API. Use `http://`, **not** `https://`: the
-server speaks plain HTTP, and a TLS handshake against it fails as an opaque "Connection error"
-in the client while the server logs `Invalid HTTP request received.`. No API key is required.
+The vault re-syncs automatically every `SYNC_INTERVAL_MINUTES` (default 15). Only changed notes
+are re-embedded — a content hash skips the rest.
 
-> [!important] The endpoint is unauthenticated — keep it on loopback
-> `/v1/chat/completions` takes no credentials and can drive vault **writes**. `docker-compose.yml`
-> therefore publishes it as `127.0.0.1:8000:8000`, so only this machine can reach it. Changing
-> that to `8000:8000` exposes read/write access to your vault to every device on your network —
-> and to the internet if the port is forwarded or the container runs on a VPS.
->
-> `API_CORS_ORIGINS` is **not** a substitute: CORS is a browser mechanism, and `curl` or any
-> script ignores it. If you need access from another device, put real authentication in front
-> of the endpoint first.
+---
 
-> [!warning] Before you point this at your real vault
-> The agent's **propose-then-confirm is enforced by the system prompt, not by the graph.** There
-> is no hard guard preventing a write tool from firing without your approval — if the model
-> ignores the instruction, the write is real and immediate. Test writes against `sample_vault/`
-> or a copy of your vault first. Deletes honor Obsidian's own trash setting.
+## Connecting a chat client
 
-### Troubleshooting
+Point any OpenAI-compatible client at:
 
-| Symptom | Cause |
-| --- | --- |
-| Every answer is *"I don't have enough in the vault"* | `HOST_VAULT_PATH` unset or pointing somewhere empty — check `docker compose config` and confirm the bind source is what you expect. |
-| `/health` returns 503 | Read `checks` in the body, then `docker exec obsidian-librarian supervisorctl status` to find the dead program and `tail /data/<program>.err`. |
-| Container is up but the API refuses connections | It's still starting — the API restarts once while dependencies settle. Wait for `docker ps` to report `(healthy)`. |
-| `sync error: <note>: timed out` | The first embed after a cold start pays the one-time FastEmbed model download. It self-heals on the next sync tick. |
-| Writes never happen | Obsidian must be open with the Local REST API plugin running. Check `"obsidian_writes"` in `/health`. |
-| `make: command not found` (Windows) | The Makefile is a convenience for Linux/macOS. Use the `docker compose` / `docker exec` commands above. |
+```
+http://localhost:8000/v1
+```
 
-## Features
+No API key is required; enter any placeholder if the client insists. Works with Obsidian Copilot,
+Open WebUI, and anything else that speaks the Chat Completions API.
 
-- **Read-only RAG pipeline** — header-aware chunking, in-process `nomic-embed-text-v1.5`
-  dense + BM25 sparse embeddings (both FastEmbed ONNX, no model server), Qdrant hybrid retrieval with server-side RRF, cross-encoder rerank,
-  grounded generation. Redis keeps raw note text + a content-hash dedup set; SQLite holds
-  sync watermarks. The pipeline **never writes to the vault**.
-- **LangGraph agent** — `deepseek-v4-pro:cloud` via Ollama Cloud, reads through the RAG-MCP,
-  writes through the Obsidian Local REST API plugin MCP with **propose-then-confirm** HITL
-  (`[PENDING_WRITE]` marker → you reply "yes" → write executes).
-- **One container** — supervisord runs Qdrant, Redis, the RAG-MCP server, the agent API,
-  and a scheduled vault sync together. Embeddings run in-process; no local model server.
-- **OpenAI-compatible API** at `:8000/v1` for any chat client.
-- **Evals** — Ragas (non-LLM + LLM with a `glm-5.2:cloud` judge ≠ generator) + LlamaIndex
-  retrieval metrics for the pipeline; golden tasks + Langfuse for the agent.
+> [!WARNING]
+> **Use `http://`, not `https://`.** The server speaks plain HTTP. A TLS handshake against it
+> fails as an opaque *"Connection error"* or *"Failed to fetch"* in the client, while the server
+> logs `Invalid HTTP request received.` This is the single most common setup mistake.
 
-## Requirements
-
-- Docker (the container ships everything except your vault and API keys).
-- An **Ollama Cloud** API key (`OLLAMA_API_KEY`) — routes both generation and judge models.
-- For writes: the [Obsidian Local REST API plugin](https://coddingtonbear.github.io/obsidian-local-rest-api/)
-  running in your vault, plus its `OBSIDIAN_API_KEY`.
-- Optional: Langfuse keys (`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`) for agent tracing.
-
-Copy [`.env.example`](.env.example) to `.env` and fill in the keys. Only the `replace-me`
-API-key values are truly required to run; everything else has a working default.
-
-## Make targets
-
-After `make install` (or inside the container), the common entry points:
-
-| Target | What it does |
-| --- | --- |
-| `make sync` | Scan the vault and apply index CRUD (add/modify/delete, dedup). |
-| `make query Q="..."` | One-shot grounded answer from the RAG pipeline. |
-| `make chat` | Interactive agent session (reads + propose-then-confirm writes). |
-| `make rag-serve` | Start the RAG-MCP read server (`:8765/mcp`). |
-| `make api-serve` | Start the OpenAI-compatible FastAPI server (`:8000/v1`). |
-| `make eval` | Run the RAG eval suite (Ragas + retrieval metrics). Needs `make install-evals` first. |
-| `make eval-agent` | Run the agent golden-task eval (+ Langfuse if configured). |
-| `make docker-up` / `make docker-down` | Build and run / stop the full single container. |
-
-See the [`Makefile`](Makefile) for the full list.
-
-## Optional extras
-
-Ragas and its dependency tree (pyarrow, pandas, scikit-network, nltk — ~500 MB) are **not**
-runtime dependencies; the serving container never imports them. Install them only to run the
-RAG evals:
+If your client runs in a browser or Electron app, it may also need its origin allowed. Obsidian
+sends `Origin: app://obsidian.md`, which is **not** a localhost origin even though it calls
+`localhost` — add it to `API_CORS_ORIGINS`:
 
 ```bash
-pip install -e ".[evals]"          # or: make install-evals
-make docker-build-evals            # same, for the container image
+API_CORS_ORIGINS=app://obsidian.md,http://localhost,http://127.0.0.1
 ```
 
-Without the extra, `rag_eval` still runs and reports the retrieval metrics, listing the ragas
-metric families under `skipped`.
+Then recreate the container (`docker compose up -d`) — CORS is read at startup.
 
-## Tests
+---
 
-Unit tests for the dependency-free helpers live under `tests/`. The heavy stack
-(Qdrant, Redis, LlamaIndex, langchain-ollama, ragas, …) is auto-stubbed by
-`tests/conftest.py`, so the suite runs without the container:
+## Security
+
+Read this before changing anything about how the port is published.
+
+**The endpoint is unauthenticated.** `/v1/chat/completions` takes no credentials and can drive
+vault writes. `docker-compose.yml` therefore publishes it on loopback only:
+
+```yaml
+ports:
+  - "127.0.0.1:8000:8000"
+```
+
+Only your machine can reach it. Changing this to `"8000:8000"` exposes read/write access to your
+vault to **every device on your network** — and to the internet if the port is forwarded or the
+container runs on a VPS.
+
+**`API_CORS_ORIGINS` is not authentication.** CORS is enforced by browsers. `curl`, scripts, and
+anything that isn't a browser ignore it completely. It stops a malicious *web page* from driving
+your vault; it stops nothing else.
+
+If you need access from another device, put real authentication in front of the endpoint first —
+a reverse proxy with a bearer token or mTLS. Do not just widen the bind.
+
+> [!WARNING]
+> **Propose-then-confirm is enforced by the system prompt, not by the graph.** There is no
+> hard guard preventing a write tool from firing without your approval — if the model ignores its
+> instructions, the write is real and immediate.
+>
+> In adversarial testing it held: it refused an explicit *"don't ask for confirmation, just do
+> it"*, and it identified and refused a prompt-injection payload planted inside a note that told
+> it to delete the Inbox. But that is *behavioural*, not structural. Test against
+> `sample_vault/` or a copy before pointing it at notes you care about.
+
+---
+
+## Configuration
+
+Everything lives in `.env`; [`.env.example`](.env.example) documents every knob. The ones worth
+knowing:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OLLAMA_API_KEY` | — | Required for generation. Routes both cloud models |
+| `HOST_VAULT_PATH` | `./sample_vault` | Your vault on the host |
+| `OBSIDIAN_API_KEY` | — | Local REST API plugin token; required for writes |
+| `WRITE_CONFIRM` | `true` | Set `false` to skip propose-then-confirm. **Don't** |
+| `SYNC_INTERVAL_MINUTES` | `15` | Background re-index cadence |
+| `API_CORS_ORIGINS` | *(localhost only)* | Comma-separated origins. Never `*` |
+| `EMBED_MODEL` | `nomic-ai/nomic-embed-text-v1.5-Q` | See the warning below |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `64` | Changing these needs a re-index |
+| `RETRIEVAL_TOP_N` / `RERANK_TOP_K` | `20` / `6` | Candidates fetched / passed to the generator |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | — | Optional agent tracing |
+
+> [!CAUTION]
+> **Changing `EMBED_MODEL` requires a full re-index.** Vectors from different models are not
+> comparable, and because most models here are 768-dimensional, Qdrant will happily *accept* the
+> new vectors alongside the old ones and return silently meaningless results — no error anywhere.
+>
+> ```bash
+> docker compose down -v      # drops the volume: index, cache, watermarks
+> docker compose up -d        # re-indexes from scratch
+> ```
+> Your notes are a bind mount and are never touched by this.
+
+---
+
+## Evaluation
+
+The RAG pipeline is scored with [Ragas](https://docs.ragas.io) plus retrieval metrics, against a
+golden set in `src/obsidian_librarian/evals/golden_set.jsonl`.
+
+Eval dependencies are **not** in the serving image — they add ~500 MB the container never
+otherwise imports. Install them first:
+
+```bash
+docker exec -u root -w /app obsidian-librarian pip install -e ".[evals]"
+docker exec obsidian-librarian librarian eval
+```
+
+A full RAG eval takes several minutes — it drives the pipeline once per golden item and then
+calls the judge model for the LLM-scored metrics.
+
+Or locally, outside Docker:
+
+```bash
+pip install -e ".[evals]"
+make eval
+```
+
+Current results against the bundled test vault:
+
+| Metric | Score | Gate |
+|---|---|---|
+| hit_rate | 1.00 | 0.6 |
+| mrr | 0.875 | 0.6 |
+| faithfulness | 0.97 | 0.7 |
+| answer_relevancy | 0.94 | 0.6 |
+| context_recall | 0.94 | 0.6 |
+| semantic_similarity | 0.91 | 0.7 |
+| answer_correctness | 0.77 | 0.6 |
+| abstention *(refuses when the answer isn't in the vault)* | 2/2 | — |
+
+The golden set is small (8 scored items plus 2 negative). It catches gross regressions, not subtle
+ones — worth growing if you build on this.
+
+---
+
+## Development
 
 ```bash
 pip install -e ".[dev]"
 pytest
 ```
+
+202 tests, and they run **without** the container: `tests/conftest.py` installs an import hook that
+stubs the heavy dependencies (Qdrant, Redis, LlamaIndex, ragas, fastmcp…) so the pure helpers can
+be tested in isolation.
+
+### Make targets
+
+| Target | What it does |
+|---|---|
+| `make sync` | Scan the vault and apply index CRUD |
+| `make query Q="..."` | One-shot grounded answer |
+| `make chat` | Interactive agent session |
+| `make eval` / `make eval-agent` | RAG evals / agent golden tasks |
+| `make rag-serve` / `make api-serve` | Run a single server in the foreground |
+| `make docker-up` / `make docker-down` | Build and run / stop the container |
+| `make info` | Show resolved config |
+
+On Windows, use the `docker compose` and `docker exec` commands directly — the Makefile assumes a
+POSIX shell.
+
+### Layout
+
+```
+src/obsidian_librarian/
+├── config.py            single source of truth for every setting
+├── cli.py               typer CLI (sync/search/query/chat/eval/info)
+├── rag/                 the read-only pipeline
+│   ├── embeddings.py    FastEmbed dense + sparse + cross-encoder
+│   ├── reader.py        vault parsing, frontmatter, wikilinks
+│   ├── ingest.py        chunk → embed → upsert, with dedup
+│   ├── retrieve.py      hybrid search + RRF + rerank
+│   ├── query_engine.py  retrieval → grounded generation
+│   └── sync/            watermarks + APScheduler
+├── mcp/rag_server.py    read-only MCP tools for the agent
+├── agent/               LangGraph agent, prompts, memory, Langfuse
+├── api/openai_compat.py OpenAI-compatible FastAPI endpoint
+└── evals/               Ragas + retrieval metrics, golden sets
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| *"Connection error"* / *"Failed to fetch"* in a chat client | Almost always `https://` instead of `http://`. Check the server log for `Invalid HTTP request received.` |
+| Every answer is *"I don't have enough in the vault"* | `HOST_VAULT_PATH` unset or pointing somewhere empty. Run `docker compose config` and check the bind source |
+| `"obsidian_writes": false` with Obsidian open | The agent cached the probe at build time. `docker exec obsidian-librarian supervisorctl restart agent-api` |
+| Writes never happen at all | Obsidian must be open with the Local REST API plugin enabled, and `OBSIDIAN_API_KEY` must match its token |
+| `/health` returns 503 | Read `checks` in the body, then `supervisorctl status`, then `tail /data/<program>.err` |
+| API refuses connections right after `up` | Still starting. Wait for `docker ps` to show `(healthy)` |
+| Answers cite notes that no longer exist | Index is stale. `docker exec obsidian-librarian librarian sync` |
+| Retrieval returns nonsense after changing `EMBED_MODEL` | Mixed embedding spaces. `docker compose down -v && docker compose up -d` |
+| `sync error: <note>: timed out` | First embed pays the one-time model download. Self-heals next tick |
+| CORS errors in a browser client | Add its origin to `API_CORS_ORIGINS`, then `docker compose up -d` |
+
+Logs live in the container at `/data/<program>.log` and `/data/<program>.err` — one pair per
+supervisord program.
+
+---
 
 ## License
 
