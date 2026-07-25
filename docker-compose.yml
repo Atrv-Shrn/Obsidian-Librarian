@@ -4,7 +4,16 @@ services:
     image: obsidian-librarian:latest
     container_name: obsidian-librarian
     ports:
-      - "8000:8000"
+      # Bound to 127.0.0.1 on the HOST, not 0.0.0.0. The endpoint is unauthenticated and
+      # write-capable (16 Obsidian write tools), so a plain "8000:8000" publishes vault
+      # read/write to every device on your network — and to the internet if the port is ever
+      # forwarded or the container runs on a VPS. CORS does not help here: it is a browser
+      # mechanism, and curl or any script ignores it entirely.
+      #
+      # Loopback binding still works for the normal setup — Obsidian, Open WebUI and Copilot
+      # all connect over localhost. Change this only if you deliberately want remote access,
+      # and put authentication in front of it first.
+      - "127.0.0.1:8000:8000"
     volumes:
       # HOST path of your vault → the container's /vault. Deliberately NOT named
       # VAULT_PATH: that name is the *container-internal* mount point (see .env.example

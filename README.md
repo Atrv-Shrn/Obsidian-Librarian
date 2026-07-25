@@ -103,7 +103,19 @@ docker exec -it obsidian-librarian librarian sync
 ```
 
 Or point a chat client at `http://localhost:8000/v1` — Obsidian Copilot, Open WebUI, or
-anything that speaks the OpenAI Chat Completions API. No API key required by the endpoint.
+anything that speaks the OpenAI Chat Completions API. Use `http://`, **not** `https://`: the
+server speaks plain HTTP, and a TLS handshake against it fails as an opaque "Connection error"
+in the client while the server logs `Invalid HTTP request received.`. No API key is required.
+
+> [!important] The endpoint is unauthenticated — keep it on loopback
+> `/v1/chat/completions` takes no credentials and can drive vault **writes**. `docker-compose.yml`
+> therefore publishes it as `127.0.0.1:8000:8000`, so only this machine can reach it. Changing
+> that to `8000:8000` exposes read/write access to your vault to every device on your network —
+> and to the internet if the port is forwarded or the container runs on a VPS.
+>
+> `API_CORS_ORIGINS` is **not** a substitute: CORS is a browser mechanism, and `curl` or any
+> script ignores it. If you need access from another device, put real authentication in front
+> of the endpoint first.
 
 > [!warning] Before you point this at your real vault
 > The agent's **propose-then-confirm is enforced by the system prompt, not by the graph.** There
