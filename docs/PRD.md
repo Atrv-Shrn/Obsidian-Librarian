@@ -413,6 +413,22 @@ A personal AI librarian for Obsidian. Two halves in **one Docker container**:
     Decline path honored (proposed delete → "no" → file survived) and an explicit
     "don't ask for confirmation" instruction was refused. Vault ledger over the whole run:
     **4 added, 0 deleted, 2 modified**, every change attributable to a test.
+  - **Agent eval: not run to completion (deliberately deferred).** Two problems surfaced. First,
+    `_run_async` used `asyncio.gather`, driving all 6 tasks concurrently over a single shared MCP
+    `ClientSession`; concurrent `call_tool` races into a langchain-mcp-adapters 0.3.0 branch that
+    returns `call_tool_result` without assigning it (`UnboundLocalError`), and LangGraph's retry
+    of the failed tool node fails identically — so the run spun rather than finishing (40
+    occurrences, no result written). Fixed by running tasks sequentially, which is also the
+    correct semantics: the write tasks mutate the vault and then assert on it, so concurrency
+    lets one task observe another's writes. Verified 0 errors afterwards. Second, the rerun then
+    reported `writes=False` — the eval spawns its own agent, and the crashed run still held MCP
+    sessions, so it fell back to read-only and its three write tasks could not be validly scored.
+    Stopped rather than reported, since a half-read-only pass/fail table is worse than none.
+    **The agent's write path is already covered more thoroughly by the 15-scenario stress test
+    above** (real writes through the live plugin, HITL propose/confirm, decline path, injection
+    refusal), so this is redundancy, not a coverage gap. Rerunning cleanly needs
+    `supervisorctl restart agent-api` first — and would also be the last unverified piece of the
+    Langfuse scoring fix, which currently shows only "zero errors", not confirmed traces landing.
   - Suite 197 → **202 passing**.
 
 ## What's next
@@ -424,6 +440,10 @@ and handing the project to someone else.
 - **Endpoint auth.** `:8000/v1` is unauthenticated and write-capable; CORS is the only gate, and
   it is an origin allowlist, not authentication. Fine behind loopback for personal use, **the
   blocker for anyone else running this.**
+- **Finish the agent eval.** Never completed a clean run (see Current state). Needs
+  `supervisorctl restart agent-api` for a fresh MCP session, then
+  `python -m obsidian_librarian.evals.agent_eval`. Also the only remaining way to confirm the
+  Langfuse scoring fix actually lands scores rather than merely not erroring.
 - **Golden sets are small.** 8 scored RAG items (+2 negative) and 6 agent tasks. The gates pass,
   but averaging over ~8 samples is a smoke test, not a quality bar. ~30 / ~15 would make
   regressions detectable rather than incidental.
