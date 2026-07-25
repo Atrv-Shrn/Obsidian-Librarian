@@ -262,7 +262,22 @@ def _run_async() -> Dict[str, Any]:
     log.info("agent eval over %d tasks (langfuse=%s)", len(tasks), langfuse_enabled())
 
     async def _all():
-        return await asyncio.gather(*[_eval_task(t) for t in tasks])
+        # Sequential, NOT ``asyncio.gather``. Every task shares one agent instance and therefore
+        # one MCP ClientSession per server; concurrent ``call_tool`` on a single session races
+        # and, in langchain-mcp-adapters 0.3.0, lands in a branch that returns
+        # ``call_tool_result`` without ever assigning it:
+        #
+        #     UnboundLocalError: cannot access local variable 'call_tool_result'
+        #
+        # LangGraph retries the failed tool node, which fails the same way, so the run spins
+        # instead of finishing (observed: 40 occurrences across all 6 tasks, no result written).
+        # The same MCP path is fine when driven one call at a time. Sequential also makes the
+        # write tasks honest — they mutate the vault and assert on it afterwards, so running
+        # them concurrently means a task can observe another task's writes.
+        out = []
+        for t in tasks:
+            out.append(await _eval_task(t))
+        return out
 
     results = asyncio.run(_all())
     passed = sum(1 for r in results if r.get("pass"))
