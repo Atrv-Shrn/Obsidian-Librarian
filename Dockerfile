@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Obsidian-Librarian — single container.
-# supervisord (PID 1) supervises: ollama, qdrant, redis, rag-mcp, agent-api.
+# supervisord (PID 1) supervises: qdrant, redis, rag-mcp, agent-api, vault-sync.
 # Embedding/rerank models download into /data on first run.
 FROM python:3.11-slim AS base
 
@@ -9,16 +9,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     VAULT_PATH=/vault \
     DATA_PATH=/data \
-    OLLAMA_LOCAL_BASE_URL=http://127.0.0.1:11434 \
     QDRANT_URL=http://127.0.0.1:6333 \
     REDIS_URL=redis://127.0.0.1:6379/0 \
     SQLITE_PATH=/data/librarian.db
 
-# ``zstd`` is required by the Ollama install script — current builds ship the payload
-# zstd-compressed and the installer aborts with "This version requires zstd for extraction"
-# without it. python:3.11-slim does not include it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates wget tar xz-utils zstd \
+        curl ca-certificates wget tar xz-utils \
         redis-server supervisor sqlite3 procps gosu \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,17 +23,12 @@ ARG QDRANT_VERSION=v1.11.3
 RUN curl -fsSL "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-x86_64-unknown-linux-gnu.tar.gz" \
     | tar -xz -C /usr/local/bin qdrant && chmod +x /usr/local/bin/qdrant
 
-# --- Ollama (local, for embeddings) ---
-# The install script unconditionally ships CUDA + Vulkan runners (cuda_v12 1.2 GB, cuda_v13
-# 831 MB, vulkan 47 MB) — 2.07 GB of GPU code this container can never use. We only serve
-# `nomic-embed-text` on CPU, and Docker Desktop gives us no GPU passthrough anyway. Deleting
-# them in the SAME layer is what actually reclaims the space (a later `rm` would only mask
-# them behind an existing layer). Verified: ollama still starts and reports library=cpu.
-# /usr/local/lib/ollama drops 2.1 GB -> 28 MB.
-RUN curl -fsSL https://ollama.com/install.sh | sh \
-    && rm -rf /usr/local/lib/ollama/cuda_v12 \
-              /usr/local/lib/ollama/cuda_v13 \
-              /usr/local/lib/ollama/vulkan
+# NOTE: no Ollama here. It was installed solely to serve the dense embedding model, and
+# FastEmbed ships nomic-embed-text-v1.5 as ONNX (run in-process alongside the BM25 sparse
+# encoder and the reranker). Removing it drops the install layer (~28 MB after stripping the
+# 2.07 GB of unusable CUDA/Vulkan runners), the `zstd` build dep the installer needed, the
+# resident server process, and the boot-blocking `ollama pull nomic-embed-text` (~274 MB on
+# first run). Generation and the Ragas judge both use Ollama *Cloud* over HTTPS.
 
 # --- Non-root runtime user ---
 # Everything (supervisord + ollama/qdrant/redis/python) runs as `librarian`. The entrypoint
@@ -85,8 +76,8 @@ VOLUME ["/vault", "/data"]
 # /health probes Qdrant + Redis and returns 503 when either is down, so `docker ps` shows
 # (unhealthy) instead of a green container serving against a dead vector store — the exact
 # failure mode seen on the first run, where qdrant sat in supervisord BACKOFF unnoticed.
-# start-period is generous: the first boot pulls nomic-embed-text (~274 MB) and the FastEmbed
-# ONNX models before the stack settles.
+# start-period is generous: the first boot downloads the FastEmbed ONNX models (nomic dense
+# ~133 MB + BM25 + cross-encoder) into /data before the stack settles.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 

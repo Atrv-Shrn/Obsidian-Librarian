@@ -11,7 +11,7 @@ tags:
   - langchain
   - llamaindex
   - obsidian
-  - ollama
+  - fastembed
   - qdrant
 type: spec
 created: 2026-07-21
@@ -72,7 +72,7 @@ flowchart LR
 
 **Who owns each step:** *we* write the reader glue, the sync, the RAG-MCP, the graph, and the
 Obsidian skill file. *LlamaIndex* owns parse/split/embed/retrieve/synthesize. *LangGraph* owns the
-agent loop. *The Obsidian plugin* owns the actual vault writes. *Ollama / Qdrant / Redis* run underneath.
+agent loop. *The Obsidian plugin* owns the actual vault writes. *Qdrant / Redis* run underneath.
 
 > [!important] Two seams
 > **Seam 1 — MCP:** the agent reaches everything through MCP tools — the **RAG-MCP** (ours, read)
@@ -86,8 +86,8 @@ agent loop. *The Obsidian plugin* owns the actual vault writes. *Ollama / Qdrant
 | Agent orchestration | **LangGraph + LangChain** | Graph loop, tool-calling, checkpointer memory |
 | LLM (agent reasoning + RAG synthesis) | **`deepseek-v4-pro:cloud` via Ollama Cloud** | Strong reasoning; reached via `ChatOllama` (`langchain-ollama`) — cloud host in `base_url`, `OLLAMA_API_KEY` as a bearer header in `client_kwargs`, model id in `model` |
 | LLM judge (RAG evals) | **`glm-5.2:cloud` via Ollama Cloud** | Ragas LLM-metric judge — a *different* model from the generator, so it never grades its own output |
-| Dense embeddings | **`nomic-embed-text` via local Ollama** | Local + free; vault never leaves the box; also Ragas's embedding metrics |
-| Sparse + rerank | **FastEmbed** (BM25 sparse + cross-encoder rerank) | In-process ONNX; exact-term recall + precision, no extra server |
+| Dense embeddings | **`nomic-embed-text-v1.5` via FastEmbed** | In-process ONNX — local + free, no model server; vault never leaves the box; also Ragas's embedding metrics |
+| Sparse + rerank | **FastEmbed** (BM25 sparse + cross-encoder rerank) | In-process ONNX; exact-term recall + precision, no extra server. Shares one model cache with the dense embedder |
 | Vector store | **Qdrant** (bundled) | **Dense + sparse per point**, server-side fusion (RRF) |
 | Raw docstore + dedup | **Redis** (bundled) | Full raw markdown for citations + content-hash dedup |
 | Sync watermarks | **SQLite** | Embedded per-file change detection, no service |
@@ -105,7 +105,7 @@ agent loop. *The Obsidian plugin* owns the actual vault writes. *Ollama / Qdrant
 
 ## Single-container architecture (runs anywhere)
 
-Our app — Ollama, Qdrant, Redis, RAG-MCP, agent, API — lives in **one image**. The **Obsidian plugin
+Our app — Qdrant, Redis, RAG-MCP, agent, API — lives in **one image**. The **Obsidian plugin
 MCP runs in your Obsidian on the host**; the container reaches it for writes. Only API keys are external.
 
 ```mermaid
@@ -113,11 +113,10 @@ flowchart TB
   Clients([Open WebUI / Obsidian Copilot]) -->|":8000 /v1/chat/completions"| API
   subgraph Host["Host (your machine, Obsidian running)"]
     Vault[("Obsidian vault<br/>bind mount, read-write")]
-    Data[("/data<br/>qdrant · redis · sqlite · ollama models")]
+    Data[("/data<br/>qdrant · redis · sqlite · fastembed models")]
     OBSMCP["Obsidian plugin MCP<br/>:27124 (writes)"]
     subgraph C["Single Docker container (supervisord = PID 1)"]
       subgraph Native["Bundled servers (localhost)"]
-        OL["ollama :11434"]
         QD["qdrant :6333"]
         RS["redis :6379"]
       end
@@ -131,7 +130,6 @@ flowchart TB
   API -->|"write (MCP) host.docker.internal:27124"| OBSMCP
   OBSMCP --> Vault
   API -->|"LLM (API key)"| LLMc(["Ollama Cloud · deepseek + glm"])
-  RM -->|dense embed| OL
   RM -->|"synthesis (API key)"| LLMc
   API -. traces .-> LF([Langfuse Cloud])
   RM --> QD
@@ -141,7 +139,6 @@ flowchart TB
 | Piece | Job | Runs | Always on? |
 |---|---|---|---|
 | `supervisord` | Start & supervise the container | PID 1 | yes |
-| Ollama (local) | Serves `nomic-embed-text` for embeddings | `127.0.0.1:11434` | yes |
 | Ollama Cloud (`deepseek` + `glm`) | LLM generation + eval judge | **external API** (key) | on call |
 | Qdrant | Dense + sparse vectors, fusion | Bundled binary, `127.0.0.1:6333` | yes |
 | Redis | Raw docstore + dedup | `redis-server`, `127.0.0.1:6379` | yes |
@@ -193,7 +190,7 @@ flowchart TB
 flowchart LR
   V[("Vault .md")] -->|"parse<br/>ObsidianReader"| N["nodes + metadata<br/>(wikilinks, backlinks, tags, frontmatter)"]
   N -->|"split<br/>MarkdownNodeParser (header-aware)"| C[chunks]
-  C -->|"embed dense<br/>Ollama nomic-embed-text"| DEN[dense vector]
+  C -->|"embed dense<br/>FastEmbed nomic-embed-text-v1.5"| DEN[dense vector]
   C -->|"embed sparse<br/>FastEmbed BM25"| SPA[sparse vector]
   DEN --> Q[("Qdrant<br/>named dense+sparse per point")]
   SPA --> Q
@@ -258,7 +255,7 @@ flowchart LR
 |---|---|---|
 | **Parse** | Read each note; pull text + wikilinks/backlinks/tags/frontmatter | `ObsidianReader` (+ our `#tags`/frontmatter extension) |
 | **Split** | Header-aware; **≈512-token chunks, ~64 overlap (~12%)**, prefer heading boundaries, only size-split inside long sections. Each chunk keeps its heading path | `MarkdownNodeParser` |
-| **Embed** | Dense (semantic) + sparse (lexical) per chunk. **Prepend nomic task prefixes** (`search_document:` on chunks, `search_query:` on queries). Embed a **title / heading-path / tags breadcrumb** with the text | Ollama `nomic-embed-text` + FastEmbed BM25 |
+| **Embed** | Dense (semantic) + sparse (lexical) per chunk. **Prepend nomic task prefixes** (`search_document:` on chunks, `search_query:` on queries) — FastEmbed does *not* add them itself, so we do. Embed a **title / heading-path / tags breadcrumb** with the text | FastEmbed `nomic-embed-text-v1.5` + FastEmbed BM25 |
 | **Retrieve** | Hybrid search, server-side RRF fusion | Qdrant |
 | **Rerank** | Cross-encoder re-scores the top-N | FastEmbed cross-encoder |
 | **Generate** | Synthesize a grounded answer + **`[[wikilink]]` citations** | deepseek (Ollama Cloud) |
@@ -499,7 +496,7 @@ flowchart TB
         RET["retrieve.py — hybrid + rerank"]
         SYN["query_engine.py — retrieve+rerank+synthesize"]
         SYNC["sync/ (watermarks.py, scheduler.py)"]
-        EMB["embeddings.py — Ollama nomic + FastEmbed BM25/rerank"]
+        EMB["embeddings.py — FastEmbed nomic + BM25 + rerank"]
       end
       MCP["mcp/rag_server.py — read tools (search/query)"]
       subgraph agent["agent/ (Part B)"]
@@ -542,7 +539,7 @@ flowchart LR
 
 ## Where we are
 
-- [ ] **M0** Scaffold: repo, `pyproject.toml`, `config.py`, Dockerfile + supervisord (ollama/qdrant/redis), `docker-compose`, `sample_vault/`, **create `docs/PRD.md`** ← next
+- [ ] **M0** Scaffold: repo, `pyproject.toml`, `config.py`, Dockerfile + supervisord (qdrant/redis), `docker-compose`, `sample_vault/`, **create `docs/PRD.md`** ← next
 - [ ] **M1** Ingestion (ObsidianReader → split → embed dense+sparse → Qdrant; Redis raw+dedup; watermarks; deletes)
 - [ ] **M2** Query engine (hybrid retrieve → rerank → synthesize) + `cli query`
 - [ ] **M3** RAG-MCP (`search_notes`, `query_notes`, …)

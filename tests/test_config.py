@@ -12,7 +12,8 @@ def test_defaults_when_env_unset(monkeypatch):
     for k in ("VAULT_PATH", "DATA_PATH", "SQLITE_PATH"):
         monkeypatch.delenv(k, raising=False)
     s = Settings()
-    assert s.embed_model == "nomic-embed-text"
+    # FastEmbed model id (in-process ONNX), not the old Ollama `nomic-embed-text` tag.
+    assert s.embed_model == "nomic-ai/nomic-embed-text-v1.5-Q"
     assert s.embed_dim == 768
     assert s.generation_model == "deepseek-v4-pro:cloud"
     assert s.judge_model == "glm-5.2:cloud"

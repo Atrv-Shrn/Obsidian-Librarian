@@ -6,10 +6,12 @@ reads env vars or hardcodes URLs/ports/models directly.
 
 Two runtime model layers (see SPEC.md, stack table):
 
-* **Local Ollama** (`OLLAMA_LOCAL_BASE_URL`, default `http://127.0.0.1:11434`) serves the
-  dense embedding model `nomic-embed-text`. Embeddings stay in-container; the vault
-  never leaves the box. Used by our custom `NomicEmbedding` (a LlamaIndex
-  `BaseEmbedding` subclass) and the Ragas embedding-based metrics.
+* **In-process FastEmbed** serves the dense embedding model `nomic-embed-text-v1.5` (ONNX)
+  alongside the BM25 sparse encoder and the cross-encoder reranker. Embeddings stay
+  in-container; the vault never leaves the box. Used by our custom `NomicEmbedding` (a
+  LlamaIndex `BaseEmbedding` subclass) and the Ragas embedding-based metrics. There is no
+  local model server: FastEmbed already ships nomic, so Ollama — which served embeddings and
+  nothing else — was removed from the container.
 * **Ollama Cloud** (`OLLAMA_BASE_URL`, default `https://ollama.com`) is reached via
   `ChatOllama` (`langchain-ollama`): the cloud host goes in `base_url`, `OLLAMA_API_KEY`
   rides as a bearer header in `client_kwargs`. The host carries **no** `/v1` suffix —
@@ -55,17 +57,17 @@ class Settings(BaseSettings):
         description="Persistent state: Qdrant, Redis dump, SQLite, Ollama models, checkpointer.",
     )
 
-    # --- Local Ollama (embeddings) ----------------------------------------
-    ollama_local_base_url: str = "http://127.0.0.1:11434"
-    embed_model: str = "nomic-embed-text"
-    embed_dim: int = 768  # nomic-embed-text output dimensionality
-    # Timeout for a single local-Ollama embedding call. Generous on purpose: the FIRST embed
-    # after a container start pays a cold model load (Ollama maps ~274 MB off disk and spins up
-    # a CPU runner), which routinely blows past a 60 s budget on a small container — observed as
-    # `sync error: <note>: timed out` on the very first sync, with the note only picked up on the
-    # next scheduled tick. Steady-state embeds take well under a second, so a high ceiling costs
-    # nothing; it only bounds a genuinely stuck request.
-    embed_request_timeout: float = 300.0
+    # --- Dense embeddings (in-process FastEmbed) --------------------------
+    # FastEmbed ships nomic-embed-text-v1.5 as ONNX, so embeddings run in-process — no model
+    # server. The ``-Q`` (quantized) build is 133 MB vs 532 MB for fp32 and 274 MB for the
+    # Ollama pull it replaced. 768-dim either way.
+    #
+    # CHANGING THIS REQUIRES A FULL RE-INDEX. Vectors from different embedding models are not
+    # comparable even at identical dimensionality, so an existing Qdrant collection would still
+    # accept the writes (the width matches) while returning silently wrong neighbours. Recreate
+    # the collection / re-sync the vault after any change here.
+    embed_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
+    embed_dim: int = 768  # nomic-embed-text-v1.5 output dimensionality
 
     # --- Ollama Cloud (LLM + judge) ---------------------------------------
     # Native Ollama API host. ChatOllama (langchain-ollama) uses the native ollama client, which

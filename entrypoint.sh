@@ -8,23 +8,23 @@ DATA="${DATA_PATH:-/data}"
 VAULT="${VAULT_PATH:-/vault}"
 APP_USER="${APP_USER:-librarian}"
 
-mkdir -p "$DATA"/{qdrant,redis,ollamamods,logs,caches} "$VAULT"
+mkdir -p "$DATA"/{qdrant,redis,logs,caches} "$VAULT"
 # Qdrant wants its working dir to exist.
 mkdir -p "$DATA/qdrant/snapshots"
 
-# Let Ollama keep models inside the persistent volume.
-export OLLAMA_MODELS="${OLLAMA_MODELS:-$DATA/ollamamods}"
-mkdir -p "$OLLAMA_MODELS"
+# No OLLAMA_MODELS dir: Ollama was removed from the container (it only ever served the dense
+# embedding model, which now runs in-process via FastEmbed). Generation + judge use Ollama Cloud.
 
-# Keep FastEmbed / HuggingFace ONNX model caches (BM25 sparse + cross-encoder rerank) on the
-# persistent volume so they're downloaded once, not on every container recreation. The app
-# passes /data/caches/fastembed as `cache_dir` to the FastEmbed constructors (see config.py);
-# HF_HOME redirects any huggingface_hub traffic for the same reason.
+# Keep FastEmbed / HuggingFace ONNX model caches (nomic dense + BM25 sparse + cross-encoder
+# rerank) on the persistent volume so they're downloaded once, not on every container
+# recreation. The app passes /data/caches/fastembed as `cache_dir` to the FastEmbed
+# constructors (see config.py); HF_HOME redirects any huggingface_hub traffic for the same
+# reason — FastEmbed fetches the nomic ONNX weights through huggingface_hub.
 export HF_HOME="${HF_HOME:-$DATA/caches/hf}"
 mkdir -p "$DATA/caches/fastembed" "$HF_HOME"
 
 # Bind mounts arrive root-owned; chown them to the runtime user so the non-root supervisord
-# and its children (ollama/qdrant/redis/python) can read the vault and write state.
+# and its children (qdrant/redis/python) can read the vault and write state.
 chown -R "$APP_USER":"$APP_USER" "$DATA" "$VAULT" 2>/dev/null || true
 
 exec gosu "$APP_USER" "$@"

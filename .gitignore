@@ -8,6 +8,11 @@ dist/
 .venv/
 venv/
 .env
+# Also ignore .env backups/variants — these carry live API keys and are easy to
+# create accidentally (e.g. `cp .env .env.bak` before an edit). A bare `.env`
+# rule does NOT cover them.
+.env.*
+!.env.example
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/

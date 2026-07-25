@@ -37,7 +37,12 @@ from langchain_core.messages import HumanMessage
 
 from ..config import get_settings
 from ..agent import graph as agent_graph
-from ..agent.observability import get_langfuse_handler, langfuse_enabled
+from ..agent.observability import (
+    flush as langfuse_flush,
+    get_langfuse_handler,
+    langfuse_enabled,
+    score_trace,
+)
 
 log = logging.getLogger(__name__)
 
@@ -234,16 +239,22 @@ async def _eval_task(task: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _score_langfuse(task_id: str, passed: bool, trace_id: Optional[str]) -> None:
-    if not langfuse_enabled():
-        return
-    try:
-        from langfuse import Langfuse
+def _score_langfuse(task_id: str, passed: bool, trace_id: Optional[str]) -> bool:
+    """Attach the task's pass/fail to its Langfuse trace. Returns True if submitted.
 
-        lf = Langfuse()
-        lf.score(name="agent_task_pass", value=1.0 if passed else 0.0, comment=task_id, trace_id=trace_id or "")
-    except Exception as e:  # never fail eval on telemetry
-        log.warning("langfuse score failed: %s", e)
+    Delegates to :func:`observability.score_trace`, which uses the v3 ``create_score`` API on
+    the shared client singleton. The previous implementation constructed a bare ``Langfuse()``
+    (no credentials — they live on the singleton) and called ``lf.score(...)``, a v2 method that
+    does not exist in v3; the resulting ``AttributeError`` was swallowed into a warning, so no
+    score ever reached Langfuse. It also passed ``trace_id or ""``, which would have orphaned
+    the score even if the call had worked.
+    """
+    return score_trace(
+        name="agent_task_pass",
+        value=1.0 if passed else 0.0,
+        trace_id=trace_id,
+        comment=task_id,
+    )
 
 
 def _run_async() -> Dict[str, Any]:
@@ -255,9 +266,14 @@ def _run_async() -> Dict[str, Any]:
 
     results = asyncio.run(_all())
     passed = sum(1 for r in results if r.get("pass"))
+    scored = 0
     for r in results:
         # Attach the score to the same trace the agent run produced, so it isn't orphaned.
-        _score_langfuse(r["id"], bool(r.get("pass")), r.get("_langfuse_trace_id"))
+        if _score_langfuse(r["id"], bool(r.get("pass")), r.get("_langfuse_trace_id")):
+            scored += 1
+    # The v3 SDK ships spans/scores asynchronously over OTel; without an explicit flush this
+    # short-lived process can exit before anything is sent and the scores never appear.
+    langfuse_flush()
 
     return {
         "n": len(tasks),
@@ -265,6 +281,10 @@ def _run_async() -> Dict[str, Any]:
         "failed": len(tasks) - passed,
         "pass_rate": passed / max(1, len(tasks)),
         "overall_pass": passed == len(tasks),
+        # Surfaced so a silent telemetry regression is visible in the eval output rather than
+        # only in logs: langfuse on + scored == 0 means scoring is broken again.
+        "langfuse_enabled": langfuse_enabled(),
+        "langfuse_scored": scored,
         "results": results,
     }
 

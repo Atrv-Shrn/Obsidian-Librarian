@@ -1,17 +1,20 @@
-"""Embedding models — dense (local Ollama nomic) + sparse (FastEmbed BM25) + rerank.
+"""Embedding models — dense (FastEmbed nomic) + sparse (FastEmbed BM25) + rerank.
 
-Three singletons, all in-process or local:
+Three singletons, all in-process — no model server, no network:
 
-* :func:`get_dense_embed_model` — ``nomic-embed-text`` served by **local** Ollama, wrapped as a
-  LlamaIndex :class:`BaseEmbedding` so it drops into ``IngestionPipeline`` / response synthesis.
-  Prepends nomic **task prefixes** (``search_document:`` on chunks, ``search_query:`` on queries)
-  — the documented way to use nomic-embed-text for retrieval.
+* :func:`get_dense_embed_model` — ``nomic-embed-text-v1.5`` run in-process by **FastEmbed**
+  (ONNX), wrapped as a LlamaIndex :class:`BaseEmbedding` so it drops into ``IngestionPipeline`` /
+  response synthesis. Prepends nomic **task prefixes** (``search_document:`` on chunks,
+  ``search_query:`` on queries) — the documented way to use nomic-embed-text for retrieval.
 * :func:`get_sparse_embed_model` — FastEmbed **BM25** sparse encoder (``Qdrant/bm25``); produces
   Qdrant ``SparseVector``s for the named sparse field.
 * :func:`get_reranker` — FastEmbed **cross-encoder** reranker (``ms-marco-MiniLM-L-6-v2``).
 
-The dense model talks to *local* Ollama (embeddings stay in-container). The cloud models
-(deepseek / glm) are never used for embeddings.
+FastEmbed already ships nomic-embed-text-v1.5, so the dense model no longer needs a local Ollama
+server: we dropped Ollama from the container entirely (it served embeddings and nothing else —
+generation and the judge both go to Ollama *Cloud*). That removes the boot-blocking ``ollama pull``
+and the server process. All three models now share one FastEmbed cache dir on the persistent
+volume. The cloud models (deepseek / glm) are never used for embeddings.
 """
 
 from __future__ import annotations
@@ -19,8 +22,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, List
 
-import httpx
-from fastembed import SparseTextEmbedding
+from fastembed import SparseTextEmbedding, TextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from llama_index.core.embeddings import BaseEmbedding
 from pydantic import PrivateAttr
@@ -37,54 +39,39 @@ __all__ = [
 
 
 class NomicEmbedding(BaseEmbedding):
-    """LlamaIndex ``BaseEmbedding`` backed by local Ollama ``nomic-embed-text``.
+    """LlamaIndex ``BaseEmbedding`` backed by in-process FastEmbed ``nomic-embed-text-v1.5``.
 
     Prepends nomic task prefixes so the same model works for both documents and queries
     (the asymmetric retrieval setup nomic-embed-text is trained for).
+
+    **The prefixes are applied here, by us.** FastEmbed does *not* add them: its ``embed()`` and
+    ``query_embed()`` produce byte-identical vectors for the same text (verified — cosine 1.0),
+    unlike some other FastEmbed models where ``query_embed`` applies a model-specific query
+    template. So we keep prefixing explicitly rather than delegating to ``query_embed``; dropping
+    the prefixes would silently degrade retrieval quality rather than fail loudly.
     """
 
-    base_url: str = "http://127.0.0.1:11434"
-    model: str = "nomic-embed-text"
+    model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
+    cache_dir: str = ""
     doc_prefix: str = "search_document: "
     query_prefix: str = "search_query: "
-    # Default mirrors ``Settings.embed_request_timeout``; see the note there on why a cold
-    # model load needs far more headroom than a steady-state embed.
-    timeout: float = 300.0
 
-    _client: PrivateAttr = PrivateAttr(default=None)
+    _model: PrivateAttr = PrivateAttr(default=None)
 
-    def __del__(self) -> None:  # pragma: no cover - best effort
-        try:
-            if self._client is not None:
-                self._client.close()
-        except Exception:
-            pass
-
-    # -- raw Ollama call -------------------------------------------------
-    def _embed_one(self, text: str) -> List[float]:
-        if self._client is None:
-            self._client = httpx.Client(timeout=self.timeout)
-        # Legacy /api/embeddings endpoint (still supported) returns {"embedding": [...]}.
-        resp = self._client.post(
-            f"{self.base_url}/api/embeddings",
-            json={"model": self.model, "prompt": text},
-        )
-        resp.raise_for_status()
-        return list(resp.json()["embedding"])
+    def _backend(self) -> TextEmbedding:
+        """Lazily construct the ONNX model (first use pays the download/load)."""
+        if self._model is None:
+            kwargs: dict = {"model_name": self.model}
+            if self.cache_dir:
+                kwargs["cache_dir"] = self.cache_dir
+            self._model = TextEmbedding(**kwargs)
+        return self._model
 
     def _embed_many(self, texts: List[str]) -> List[List[float]]:
-        # Ollama's newer /api/embed accepts a batch under "input".
-        if self._client is None:
-            self._client = httpx.Client(timeout=self.timeout)
-        resp = self._client.post(
-            f"{self.base_url}/api/embed",
-            json={"model": self.model, "input": texts},
-            timeout=max(self.timeout, 10.0 * len(texts)),
-        )
-        if resp.status_code == 404:  # very old Ollama — fall back to per-text
-            return [self._embed_one(t) for t in texts]
-        resp.raise_for_status()
-        return [list(v) for v in resp.json()["embeddings"]]
+        return [list(map(float, v)) for v in self._backend().embed(texts)]
+
+    def _embed_one(self, text: str) -> List[float]:
+        return self._embed_many([text])[0]
 
     # -- BaseEmbedding interface ----------------------------------------
     def _get_query_embedding(self, query: str) -> List[float]:
@@ -107,10 +94,10 @@ class NomicEmbedding(BaseEmbedding):
 
     async def _aget_query_embeddings(self, queries: List[str]) -> List[List[float]]:
         # Queries use the query prefix (not the doc prefix); mirror the sync path.
-        return [self._get_query_embedding(q) for q in queries]
+        return self._embed_many([f"{self.query_prefix}{q}" for q in queries])
 
     def _get_query_embeddings(self, queries: List[str]) -> List[List[float]]:
-        return [self._get_query_embedding(q) for q in queries]
+        return self._embed_many([f"{self.query_prefix}{q}" for q in queries])
 
 
 @lru_cache(maxsize=1)
@@ -119,12 +106,14 @@ def get_dense_embed_model() -> NomicEmbedding:
     # NOTE: no ``embed_dim=`` here — ``NomicEmbedding`` declares no such field, so pydantic's
     # default ``extra="ignore"`` silently dropped it. The collection's vector width comes from
     # ``settings.embed_dim`` at ``ensure_collection`` time, which is the only place it matters.
+    # (v1.5-Q is 768-dim, same as the Ollama model it replaced, so existing collections stay
+    # dimensionally valid — but vectors from the two models are NOT interchangeable; see the
+    # re-index note in ``Settings.embed_model``.)
     return NomicEmbedding(
-        base_url=s.ollama_local_base_url,
         model=s.embed_model,
+        cache_dir=str(s.fastembed_cache_path),
         doc_prefix=s.embed_doc_prefix,
         query_prefix=s.embed_query_prefix,
-        timeout=s.embed_request_timeout,
     )
 
 

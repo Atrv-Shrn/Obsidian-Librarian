@@ -3,7 +3,7 @@ title: Obsidian-Librarian — PRD / Living State
 tags: [prd, project-state]
 type: prd
 created: 2026-07-21
-updated: 2026-07-23
+updated: 2026-07-25
 related:
   - "[[SPEC]]"
 ---
@@ -19,7 +19,7 @@ A personal AI librarian for Obsidian. Two halves in **one Docker container**:
 
 - **Part A — RAG pipeline** (read-only): LlamaIndex parse→split→embed→retrieve→rerank→generate.
   Qdrant (dense+sparse, RRF) + Redis (raw docstore + dedup) + SQLite (watermarks) +
-  local Ollama `nomic-embed-text`. Evaluated by Ragas (non-LLM + LLM w/ `glm-5.2:cloud`
+  in-process FastEmbed `nomic-embed-text-v1.5`. Evaluated by Ragas (non-LLM + LLM w/ `glm-5.2:cloud`
   judge) + LlamaIndex retrieval metrics + golden set. **Never writes, never uses Langfuse.**
 - **Part B — Agent**: LangGraph + LangChain, `deepseek-v4-pro:cloud` via Ollama Cloud.
   Reads via our RAG-MCP; **writes via the Obsidian Local REST API plugin MCP**
@@ -29,8 +29,8 @@ A personal AI librarian for Obsidian. Two halves in **one Docker container**:
 ## Locked decisions (with reasoning)
 
 - **Pipeline read-only, agent owns all writes** — pipeline only feeds info; agent controls vault.
-- **Single container** — runs anywhere; supervisord = PID1 over ollama/qdrant/redis/rag-mcp/agent-api.
-- **Three models, three roles**: `nomic-embed-text` (local) embeds; `deepseek-v4-pro:cloud` generates;
+- **Single container** — runs anywhere; supervisord = PID1 over qdrant/redis/rag-mcp/agent-api/vault-sync.
+- **Three models, three roles**: `nomic-embed-text-v1.5` (in-process FastEmbed) embeds; `deepseek-v4-pro:cloud` generates;
   `glm-5.2:cloud` judges (≠ generator → no self-preference bias).
 - **Baseline = hybrid (dense+sparse in Qdrant, server-side RRF) + cross-encoder rerank + generate** — not dense-only.
 - **Writes via Obsidian plugin MCP** (boots with Obsidian, surgical PATCH by heading/block/frontmatter,
@@ -62,8 +62,8 @@ A personal AI librarian for Obsidian. Two halves in **one Docker container**:
   `rag/sync/{watermarks,scheduler}.py`; `mcp/rag_server.py`;
   `agent/{llm,prompts,memory,observability,graph}.py`, `agent/skills/obsidian.md`;
   `api/openai_compat.py`; `evals/{rag_eval,agent_eval}.py`, `evals/{golden_set,agent_tasks}.jsonl`.
-- Packaging: `pyproject.toml`, `Dockerfile`, `supervisord.conf` (ollama/ollama-bootstrap/qdrant/
-  redis/rag-mcp/agent-api/vault-sync), `docker-compose.yml`, `entrypoint.sh`, `Makefile`, `.env.example`.
+- Packaging: `pyproject.toml`, `Dockerfile`, `supervisord.conf` (qdrant/redis/rag-mcp/
+  agent-api/vault-sync), `docker-compose.yml`, `entrypoint.sh`, `Makefile`, `.env.example`.
 - `python -m compileall` passes (all modules syntactically valid).
 - **Verify pass complete.** Adversarial cross-module review ran; all confirmed findings applied:
   - `rag/embeddings.py`: fastembed reranker import path (`fastembed.rerank.cross_encoder.TextCrossEncoder`);
@@ -306,6 +306,61 @@ A personal AI librarian for Obsidian. Two halves in **one Docker container**:
     `dup=1` — a failed index should not register its hash. Accounting-only, not data loss.
     (c) `/health` reports `status: ok` from settings alone; it never probes Qdrant/Redis, so it
     returned `ok` the whole time qdrant was in BACKOFF. A real dependency probe is worth adding.
+
+- **Telemetry + eval-gate + embedding-stack pass (2026-07-25, branch `prototype`):** three
+  user-directed fixes, each a real defect rather than a style change.
+  - **Langfuse scores never landed (two independent bugs, both silent).** (a)
+    `graph.ainvoke` read the trace id via `handler.get_trace_id()`, but the **v3**
+    `CallbackHandler` has no such method (it only holds `.client`) — every call raised
+    `AttributeError` into a bare `except`, so `_langfuse_trace_id` was always `None`. (b)
+    `agent_eval._score_langfuse` called `Langfuse().score(...)`, a **v2** method absent in v3,
+    on a credential-less bare client — the `AttributeError` was swallowed into a log warning.
+    Either bug alone was enough to lose every score. Fixed: `observability` gained
+    `get_langfuse_client()` / `current_trace_id()` / `score_trace()` / `flush()` on the v3 API
+    (`get_client`, `create_score`); `ainvoke` and `astream` now wrap the run in an explicit
+    `start_as_current_span("agent-turn")` and read the id from the **live OTel context** (v3 is
+    OpenTelemetry-based — the id only exists while the call is on the stack, so reading it after
+    the call returned could never work); the eval flushes before exit (the SDK ships
+    asynchronously, so a short-lived process exited before anything was sent) and now reports
+    `langfuse_enabled` / `langfuse_scored` in its result so a silent regression is visible.
+    `score_trace` refuses a falsy trace id rather than sending `""` — that was the orphaning.
+  - **Ragas threshold keys didn't match the emitted column names → 4 of 10 metrics were never
+    gated.** The gate is `{k: ... if k in flat}`, so a key matching no column is silently
+    dropped. Ragas columns come from each metric class's `name` attribute, which is *not* the
+    class name snake-cased. Verified against ragas 0.4.3: `ResponseRelevancy` → `answer_relevancy`
+    (we keyed `response_relevancy`), `NonLLMContextRecall` → `non_llm_context_recall`,
+    `LLMContextPrecisionWithReference` → `llm_context_precision_with_reference`,
+    `NonLLMContextPrecisionWithReference` → `non_llm_context_precision_with_reference` (we keyed
+    a bare `context_precision`, which **no** metric emits). Only `LLMContextRecall` really emits
+    `context_recall`. `_THRESHOLDS` rewritten to the verified names with the full class→column
+    map inline; this also retires the earlier "both families emit `context_precision`" assumption
+    — only recall ever collided, so the `retrieval_context_*` namespacing is still required, but
+    for recall alone.
+  - **Dropped local Ollama entirely; dense embeddings now run in-process via FastEmbed.**
+    FastEmbed already ships `nomic-embed-text-v1.5`, and local Ollama existed *only* to serve
+    embeddings (generation + judge both go to Ollama **Cloud**), so the server had no remaining
+    job. `NomicEmbedding` now wraps `fastembed.TextEmbedding` instead of HTTP-calling Ollama;
+    removed the `ollama` + `ollama-bootstrap` supervisord programs, the Ollama install layer and
+    its `zstd` build dep, `OLLAMA_LOCAL_BASE_URL`, `EMBED_REQUEST_TIMEOUT` (no request to time
+    out), and the `/data/ollamamods` dir. Model default is `nomic-ai/nomic-embed-text-v1.5-Q`
+    (quantized, **133 MB** vs the 274 MB Ollama pull it replaces and 532 MB for fp32); 768-dim
+    either way, so collection width is unchanged. **Verified against the real model:** 768 dims,
+    and a query ranks a relevant note above an unrelated one (cos 0.74 vs 0.45).
+    **Critical detail:** FastEmbed does **not** apply nomic's task prefixes — its `embed()` and
+    `query_embed()` return identical vectors (measured cosine 1.0) — so `search_document: ` /
+    `search_query: ` stay our responsibility and are still applied in `NomicEmbedding`. Dropping
+    them would degrade retrieval silently rather than fail. **Changing `EMBED_MODEL` now requires
+    a full re-index** (a same-width collection accepts foreign vectors and returns wrong
+    neighbours); noted in `config.py` and `.env.example`.
+  - `docs/SPEC.md` reconciled to the new stack (stack table, container diagram, component table,
+    ingestion flow, file skeleton); `README.md` and `.env.example` likewise.
+  - Test-adequacy guards added: 7 Langfuse-scoring guards (v3 `create_score` pinned, empty-trace
+    refusal, disabled/erroring no-ops, `current_trace_id` from the live client, flush passthrough,
+    plus a guard pinning the upstream fact that v3's `CallbackHandler` has no `get_trace_id`), a
+    threshold-key↔column-name conformance test that fails loudly if a key ever stops matching a
+    real Ragas column, and FastEmbed wiring guards (model id shape, exact constructor kwargs,
+    persistent shared cache dir, query-prefix on both batch paths). Suite 165 → **197 passing**
+    (+1 skipped when the langfuse langchain extra isn't importable).
 
 ## What's next
 

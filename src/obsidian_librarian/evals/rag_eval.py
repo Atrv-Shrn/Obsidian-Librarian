@@ -37,18 +37,42 @@ log = logging.getLogger(__name__)
 _GOLDEN = Path(__file__).parent / "golden_set.jsonl"
 
 # Pass/fail thresholds (SPEC.md). A metric below threshold flags the run.
-# ``context_recall`` / ``context_precision`` gate the Ragas LLM/non-LLM context metrics; the
-# path-overlap retrieval variants are gated under their own ``retrieval_context_*`` keys so the
-# two families are scored independently (see the merge in :func:`run`).
+#
+# The keys MUST be the column names Ragas actually emits, which are each metric class's ``name``
+# attribute — NOT the class name snake-cased. The gate is ``{k: flat[k] >= thr for k, thr in
+# _THRESHOLDS.items() if k in flat}``, so a key that never appears as a column is silently
+# dropped and that metric is never gated at all. The verified v0.4 class → column mapping for the
+# metrics we configure (see :func:`run`):
+#
+#   Faithfulness                        -> faithfulness
+#   ResponseRelevancy                   -> answer_relevancy          (NOT response_relevancy)
+#   AnswerCorrectness                   -> answer_correctness
+#   SemanticSimilarity                  -> semantic_similarity
+#   LLMContextRecall                    -> context_recall
+#   NonLLMContextRecall                 -> non_llm_context_recall    (NOT context_recall)
+#   LLMContextPrecisionWithReference    -> llm_context_precision_with_reference
+#   NonLLMContextPrecisionWithReference -> non_llm_context_precision_with_reference
+#   AspectCritic(name="helpfulness")    -> helpfulness               (caller-supplied name)
+#   BleuScore/RougeScore/ExactMatch/StringPresence -> bleu_score/rouge_score/exact_match/string_present
+#
+# Note this also retires the earlier "both families emit ``context_precision``" assumption: only
+# ``LLMContextRecall`` collides with our retrieval-derived ``context_recall``, and the precision
+# classes emit distinct, fully-qualified columns. The ``retrieval_*`` namespacing is still
+# correct and still required for recall — it is what keeps the two recall families independent.
 _THRESHOLDS = {
+    # --- Ragas LLM metrics ---
     "faithfulness": 0.7,
-    "response_relevancy": 0.6,
+    "answer_relevancy": 0.6,
     "answer_correctness": 0.6,
-    "context_recall": 0.6,
-    "context_precision": 0.6,
+    "context_recall": 0.6,  # LLMContextRecall
+    "llm_context_precision_with_reference": 0.6,
+    # --- Ragas non-LLM metrics ---
+    "semantic_similarity": 0.7,
+    "non_llm_context_recall": 0.6,
+    "non_llm_context_precision_with_reference": 0.6,
+    # --- our path-overlap retrieval metrics (namespaced; see the merge in ``run``) ---
     "retrieval_context_recall": 0.6,
     "retrieval_context_precision": 0.6,
-    "semantic_similarity": 0.7,
     "hit_rate": 0.6,
     "mrr": 0.6,
 }
@@ -392,13 +416,15 @@ def run() -> Dict[str, Any]:
         results["skipped"].append(f"ragas_import: {e}")
 
     # 3) Threshold pass/fail.
-    # The Ragas LLM/non-LLM context metrics and our path-overlap retrieval context metrics both
-    # emit columns named ``context_recall`` / ``context_precision``. Merging them under the same
-    # key would let whichever family is written last silently clobber the other, so the gate
-    # would test only one family and mask the other (e.g. a run with Ragas LLMContextRecall=0.3
-    # but retrieval recall=0.8 would pass the >=0.6 gate on the retrieval value). Namespace the
-    # retrieval-derived context metrics as ``retrieval_context_*`` so both families are gated
-    # independently under their own thresholds.
+    # ``LLMContextRecall`` emits a column literally named ``context_recall`` — the same name our
+    # path-overlap retrieval recall would use. Merging them under one key would let whichever is
+    # written last silently clobber the other, so the gate would test only one family and mask
+    # the other (a run with Ragas LLMContextRecall=0.3 but retrieval recall=0.8 would pass the
+    # >=0.6 gate on the retrieval value). Namespacing the retrieval-derived context metrics as
+    # ``retrieval_context_*`` keeps both families gated independently under their own thresholds.
+    # (The precision classes emit fully-qualified distinct names — ``llm_context_precision_with_
+    # reference`` / ``non_llm_context_precision_with_reference`` — so they never collided; the
+    # namespacing is harmless there and kept for symmetry. See ``_THRESHOLDS`` for the full map.)
     flat = {**results["ragas_non_llm"], **results["ragas_llm"],
             "hit_rate": hit_rate, "mrr": mrr,
             "retrieval_context_precision": context_precision,

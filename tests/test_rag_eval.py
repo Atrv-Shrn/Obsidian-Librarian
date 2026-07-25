@@ -91,12 +91,52 @@ def test_extract_scores_total_failure_returns_empty():
 
 def test_thresholds_shape():
     assert _THRESHOLDS["faithfulness"] == 0.7
-    assert _THRESHOLDS["response_relevancy"] == 0.6
+    assert _THRESHOLDS["answer_relevancy"] == 0.6
     assert _THRESHOLDS["hit_rate"] == 0.6
     assert _THRESHOLDS["mrr"] == 0.6
     # No threshold accidentally below 0 or above 1.
     for k, v in _THRESHOLDS.items():
         assert 0.0 < v <= 1.0, k
+
+
+def test_threshold_keys_match_real_ragas_column_names():
+    """Every Ragas threshold key must be a column Ragas actually emits.
+
+    The gate is ``{k: ... for k, thr in _THRESHOLDS.items() if k in flat}``, so a key that never
+    appears as a column is silently skipped and that metric goes **ungated** — a
+    below-threshold score would not flag the run. Ragas column names are each metric class's
+    ``name`` attribute, which is NOT the class name snake-cased: ``ResponseRelevancy`` emits
+    ``answer_relevancy``, ``NonLLMContextRecall`` emits ``non_llm_context_recall``, and the
+    precision classes emit fully-qualified ``*_with_reference`` names. This pins the mapping so
+    a future rename or metric swap fails loudly here instead of silently disabling a gate.
+    """
+    # Verified against ragas 0.4.x for exactly the metric set ``run()`` configures.
+    ragas_columns = {
+        "faithfulness",
+        "answer_relevancy",
+        "answer_correctness",
+        "semantic_similarity",
+        "context_recall",
+        "non_llm_context_recall",
+        "llm_context_precision_with_reference",
+        "non_llm_context_precision_with_reference",
+        "bleu_score",
+        "rouge_score",
+        "exact_match",
+        "string_present",
+        "helpfulness",
+    }
+    # Keys we compute ourselves rather than getting from Ragas.
+    ours = {"hit_rate", "mrr", "retrieval_context_recall", "retrieval_context_precision"}
+
+    unknown = set(_THRESHOLDS) - ragas_columns - ours
+    assert not unknown, f"threshold keys that match no real Ragas column (never gated): {unknown}"
+
+    # The specific regressions that motivated this test.
+    assert "response_relevancy" not in _THRESHOLDS  # ResponseRelevancy emits answer_relevancy
+    assert "context_precision" not in _THRESHOLDS  # no metric emits a bare context_precision
+    assert "answer_relevancy" in _THRESHOLDS
+    assert "non_llm_context_recall" in _THRESHOLDS
 
 
 # --------------------------------------------------------------------------- _retrieval_paths
@@ -189,11 +229,12 @@ def test_run_threshold_gate_gates_ragas_and_retrieval_context_independently(monk
         rag_eval, "_extract_ragas_scores",
         lambda out: {
             "faithfulness": 0.9,
-            "response_relevancy": 0.9,
+            "answer_relevancy": 0.9,
             "answer_correctness": 0.9,
             "semantic_similarity": 0.9,
+            # LLMContextRecall's real column name — the one that collides with our retrieval recall.
             "context_recall": 0.3,  # Ragas context metric — below threshold
-            "context_precision": 0.3,
+            "llm_context_precision_with_reference": 0.3,
         },
     )
 
@@ -202,9 +243,9 @@ def test_run_threshold_gate_gates_ragas_and_retrieval_context_independently(monk
     # Retrieval path-overlap: a.md retrieved vs [a.md] relevant → recall 1.0, precision 1.0.
     assert out["retrieval"]["context_recall"] == 1.0
     assert out["retrieval"]["context_precision"] == 1.0
-    # Ragas context metrics gated under ``context_*`` and NOT overwritten by the retrieval 1.0.
+    # Ragas context metrics gated under their own columns, NOT overwritten by the retrieval 1.0.
     assert out["pass"]["context_recall"] is False
-    assert out["pass"]["context_precision"] is False
+    assert out["pass"]["llm_context_precision_with_reference"] is False
     # Retrieval context metrics gated under their own namespaced keys.
     assert out["pass"]["retrieval_context_recall"] is True
     assert out["pass"]["retrieval_context_precision"] is True

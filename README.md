@@ -1,7 +1,7 @@
 # Obsidian-Librarian
 
 A personal AI librarian for your [Obsidian](https://obsidian.md) vault — a **read-only
-RAG pipeline** (LlamaIndex + Qdrant + Redis + local Ollama embeddings) that turns your
+RAG pipeline** (LlamaIndex + Qdrant + Redis + in-process FastEmbed embeddings) that turns your
 notes into grounded answers, and a **LangGraph agent** (deepseek via Ollama Cloud) that
 reasons over those tools, talks to you, and controls the vault — create, edit, delete
 notes — through the Obsidian Local REST API plugin. **Ships as one Docker container.**
@@ -55,12 +55,13 @@ OBSIDIAN_API_KEY=...                       # only if you want the agent to write
 ### 4. Build and start
 
 ```bash
-docker compose build      # first build is slow: it downloads Qdrant, Ollama and ~250 MB of wheels
+docker compose build      # first build is slow: it downloads Qdrant and ~250 MB of wheels
 docker compose up -d
 ```
 
-On **first** start the container also pulls `nomic-embed-text` (~274 MB) and the FastEmbed ONNX
-models, then indexes your vault. Expect a few minutes before it answers. Watch it happen:
+On **first** start the container downloads the FastEmbed ONNX models (nomic dense ~133 MB,
+BM25 sparse, cross-encoder rerank) into `/data`, then indexes your vault. Expect a few minutes
+before it answers. Watch it happen:
 
 ```bash
 docker compose logs -f
@@ -86,9 +87,7 @@ If a dependency is down you get **503** and `"status":"degraded"` with the culpr
 docker exec obsidian-librarian supervisorctl status
 ```
 
-All seven of `ollama`, `qdrant`, `redis`, `rag-mcp`, `agent-api`, `vault-sync` should be
-`RUNNING` (`ollama-bootstrap` correctly shows `EXITED` — it pulls the embedding model once and
-stops).
+All five of `qdrant`, `redis`, `rag-mcp`, `agent-api`, `vault-sync` should be `RUNNING`.
 
 ### 6. Use it
 
@@ -119,21 +118,21 @@ anything that speaks the OpenAI Chat Completions API. No API key required by the
 | Every answer is *"I don't have enough in the vault"* | `HOST_VAULT_PATH` unset or pointing somewhere empty — check `docker compose config` and confirm the bind source is what you expect. |
 | `/health` returns 503 | Read `checks` in the body, then `docker exec obsidian-librarian supervisorctl status` to find the dead program and `tail /data/<program>.err`. |
 | Container is up but the API refuses connections | It's still starting — the API restarts once while dependencies settle. Wait for `docker ps` to report `(healthy)`. |
-| `sync error: <note>: timed out` | The first embed after a cold start can be slow. It self-heals on the next sync tick; raise `EMBED_REQUEST_TIMEOUT` if it persists. |
+| `sync error: <note>: timed out` | The first embed after a cold start pays the one-time FastEmbed model download. It self-heals on the next sync tick. |
 | Writes never happen | Obsidian must be open with the Local REST API plugin running. Check `"obsidian_writes"` in `/health`. |
 | `make: command not found` (Windows) | The Makefile is a convenience for Linux/macOS. Use the `docker compose` / `docker exec` commands above. |
 
 ## Features
 
-- **Read-only RAG pipeline** — header-aware chunking, local `nomic-embed-text` dense + BM25
-  sparse embeddings, Qdrant hybrid retrieval with server-side RRF, cross-encoder rerank,
+- **Read-only RAG pipeline** — header-aware chunking, in-process `nomic-embed-text-v1.5`
+  dense + BM25 sparse embeddings (both FastEmbed ONNX, no model server), Qdrant hybrid retrieval with server-side RRF, cross-encoder rerank,
   grounded generation. Redis keeps raw note text + a content-hash dedup set; SQLite holds
   sync watermarks. The pipeline **never writes to the vault**.
 - **LangGraph agent** — `deepseek-v4-pro:cloud` via Ollama Cloud, reads through the RAG-MCP,
   writes through the Obsidian Local REST API plugin MCP with **propose-then-confirm** HITL
   (`[PENDING_WRITE]` marker → you reply "yes" → write executes).
-- **One container** — supervisord runs Ollama, Qdrant, Redis, the RAG-MCP server, the agent
-  API, and a scheduled vault sync together.
+- **One container** — supervisord runs Qdrant, Redis, the RAG-MCP server, the agent API,
+  and a scheduled vault sync together. Embeddings run in-process; no local model server.
 - **OpenAI-compatible API** at `:8000/v1` for any chat client.
 - **Evals** — Ragas (non-LLM + LLM with a `glm-5.2:cloud` judge ≠ generator) + LlamaIndex
   retrieval metrics for the pipeline; golden tasks + Langfuse for the agent.

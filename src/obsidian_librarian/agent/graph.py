@@ -26,7 +26,12 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from ..config import get_settings
 from .llm import get_agent_llm
 from .memory import get_checkpointer
-from .observability import get_langfuse_handler, langfuse_enabled
+from .observability import (
+    current_trace_id,
+    get_langfuse_client,
+    get_langfuse_handler,
+    langfuse_enabled,
+)
 from .prompts import build_system_prompt
 
 log = logging.getLogger(__name__)
@@ -307,25 +312,56 @@ async def ainvoke(messages: list, thread_id: Optional[str] = None) -> dict:
     await _repair_dangling_tool_calls(agent, tid)
     new_msgs = await _reconcile_new_messages(agent, messages, tid)
     config, handler = _invoke_config(thread_id)
-    result = await agent.ainvoke({"messages": new_msgs}, config=config)
-    if handler is not None:
+    if handler is None:
+        return await agent.ainvoke({"messages": new_msgs}, config=config)
+
+    # Wrap the run in an explicit Langfuse span so we own a trace id we can score against.
+    # The v3 SDK is OpenTelemetry-based: the trace id lives in the *active context*, so it can
+    # only be read while the call is on the stack — reading it after ``ainvoke`` returns (as we
+    # used to, via the handler) yields nothing, because the span has already closed. The old
+    # code called ``handler.get_trace_id()``, which doesn't exist in v3 at all, so the trace id
+    # was always ``None`` and every score was orphaned.
+    client = get_langfuse_client()
+    if client is None:
+        return await agent.ainvoke({"messages": new_msgs}, config=config)
+    with client.start_as_current_span(name="agent-turn") as span:
+        trace_id = current_trace_id()
+        result = await agent.ainvoke({"messages": new_msgs}, config=config)
         try:
-            result["_langfuse_trace_id"] = handler.get_trace_id()
+            span.update_trace(session_id=tid)
         except Exception:  # pragma: no cover - tracing is best-effort
             pass
+    result["_langfuse_trace_id"] = trace_id
     return result
 
 
 async def astream(messages: list, thread_id: Optional[str] = None):
-    """Stream agent events for one turn (used by the SSE FastAPI layer)."""
+    """Stream agent events for one turn (used by the SSE FastAPI layer).
+
+    Wrapped in the same explicit Langfuse span as :func:`ainvoke` so a streamed chat turn
+    produces one grouped trace tagged with its thread, rather than loose spans. The span must
+    stay open for the whole generator — closing it before the stream drains would orphan every
+    event after the first.
+    """
     agent = await build_agent()
     tid = thread_id or get_settings().api_default_thread_id
     await _repair_dangling_tool_calls(agent, tid)
     new_msgs = await _reconcile_new_messages(agent, messages, tid)
-    async for event in agent.astream_events(
-        {"messages": new_msgs}, config=_invoke_config(thread_id)[0], version="v2"
-    ):
-        yield event
+    config = _invoke_config(thread_id)[0]
+
+    client = get_langfuse_client() if langfuse_enabled() else None
+    if client is None:
+        async for event in agent.astream_events({"messages": new_msgs}, config=config, version="v2"):
+            yield event
+        return
+
+    with client.start_as_current_span(name="agent-turn") as span:
+        try:
+            span.update_trace(session_id=tid)
+        except Exception:  # pragma: no cover - tracing is best-effort
+            pass
+        async for event in agent.astream_events({"messages": new_msgs}, config=config, version="v2"):
+            yield event
 
 
 def reset_agent_cache() -> None:
