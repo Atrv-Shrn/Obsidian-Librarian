@@ -68,8 +68,15 @@ _THRESHOLDS = {
     "llm_context_precision_with_reference": 0.6,
     # --- Ragas non-LLM metrics ---
     "semantic_similarity": 0.7,
-    "non_llm_context_recall": 0.6,
-    "non_llm_context_precision_with_reference": 0.6,
+    # NOTE: ``non_llm_context_recall`` / ``non_llm_context_precision_with_reference`` are NOT
+    # gated. They compare ``reference_contexts`` to ``retrieved_contexts`` by *string distance*,
+    # so they score how exactly the golden file transcribes the pipeline's chunk text — heading
+    # prefixes ("# Reranking\n\n"), chunk boundaries and whitespace all count against them. Our
+    # references are hand-written excerpts, so these read ~0.06-0.12 even when retrieval is
+    # perfect (hit_rate 1.0, and the LLM-judged equivalents score 0.94/0.83 on the same run).
+    # Gating them would make the suite fail on transcription fidelity rather than retrieval
+    # quality. They stay in the output as diagnostics; ``context_recall`` and
+    # ``llm_context_precision_with_reference`` are the gated context metrics.
     # --- our path-overlap retrieval metrics (namespaced; see the merge in ``run``) ---
     "retrieval_context_recall": 0.6,
     "retrieval_context_precision": 0.6,
@@ -82,7 +89,19 @@ _THRESHOLDS = {
 
 
 class _NomicLangchainEmbeddings:
-    """LangChain-style embeddings backed by our local nomic model (for Ragas)."""
+    """LangChain-style embeddings backed by our nomic model (for Ragas).
+
+    Implements the **async** ``aembed_*`` methods as well as the sync ones. Ragas drives its
+    metrics through an async executor and calls ``aembed_documents`` / ``aembed_query``; with
+    only the sync pair defined, every embedding-backed metric raised
+    ``AttributeError('_NomicLangchainEmbeddings' object has no attribute 'aembed_documents')``
+    inside the job, which Ragas swallows per-row and reports as ``NaN`` rather than failing the
+    run. That silently blanked ``semantic_similarity`` (and, via the same path, the metrics that
+    depend on embeddings) while the suite still looked like it had "run".
+
+    The underlying FastEmbed model is synchronous CPU work, so the async methods just delegate
+    — no thread offload, matching how the rest of the eval already calls it.
+    """
 
     def __init__(self) -> None:
         from ..rag.embeddings import get_dense_embed_model
@@ -94,6 +113,12 @@ class _NomicLangchainEmbeddings:
 
     def embed_query(self, text: str) -> List[float]:
         return list(map(float, self._model._get_text_embedding(text)))
+
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self.embed_documents(texts)
+
+    async def aembed_query(self, text: str) -> List[float]:
+        return self.embed_query(text)
 
 
 def _judge_llm():
@@ -173,14 +198,43 @@ def _path_matches(p: str, ref: str) -> bool:
     return False
 
 
+_ABSTENTION_MARKERS = (
+    "don't have enough",
+    "do not have enough",
+    "doesn't contain",
+    "does not contain",
+    "no notes",
+    "not in the vault",
+    "nothing in the vault",
+    "no mention",
+    "not mentioned",
+    "couldn't find",
+    "could not find",
+    "no relevant",
+)
+
+
+def _is_abstention(answer: str) -> bool:
+    """True if the answer declines to answer rather than inventing content.
+
+    Deliberately a substring check over a small marker set, not an LLM call: the negative items
+    exist to catch hallucination, and gating that check behind another model call would make the
+    hallucination metric itself depend on a model's judgement. Normalized to lowercase with
+    curly apostrophes folded so "don't" (U+2019) matches the ASCII form.
+    """
+    a = (answer or "").lower().replace("’", "'")
+    return any(m in a for m in _ABSTENTION_MARKERS)
+
+
 def _retrieval_paths(question: str, relevant_paths: List[str]) -> Dict[str, Optional[float]]:
     """Hit-rate, MRR, and context precision/recall of retrieval vs ``relevant_paths``.
 
     SPEC line 290: retrieval metrics are hit-rate, MRR, **and** context precision/recall.
-    Context precision/recall are computed as path-set overlap with the same fuzzy path match
-    hit-rate uses: recall = |retrieved ∩ relevant| / |relevant| (of the notes we expected, how
-    many surfaced); precision = |retrieved ∩ relevant| / |retrieved| (of what surfaced, how
-    much was relevant).
+    Both use the same fuzzy path match hit-rate uses. Recall = |retrieved ∩ relevant| /
+    |relevant| (of the notes we expected, how many surfaced). Precision is **R-precision** —
+    precision within the top-R retrieved, where R = len(relevant_paths) — not precision over
+    the full k=20 candidate pool; see the note at the computation for why the pool-wide form
+    made the metric unpassable by construction.
 
     Returns ``None`` for every metric when there are no ``relevant_paths`` (a golden item with
     no ground-truth retrieval expectation). Such items are **skipped** from the averages rather
@@ -202,9 +256,25 @@ def _retrieval_paths(question: str, relevant_paths: List[str]) -> Dict[str, Opti
                     rr = 1.0 / rank
                 break
     recall_count = sum(1 for ref in relevant_paths if any(_path_matches(p, ref) for p in retrieved))
-    precision_count = sum(1 for p in retrieved if any(_path_matches(p, ref) for ref in relevant_paths))
     context_recall = recall_count / len(relevant_paths)
-    context_precision = (precision_count / len(retrieved)) if retrieved else 0.0
+
+    # Precision is **R-precision**: precision within the top-R retrieved, where R is the number
+    # of relevant notes for this question — NOT precision over the whole candidate pool.
+    #
+    # Dividing by len(retrieved) is wrong here because ``search`` always returns k=20 candidates
+    # (that pool exists to feed the reranker, not to be a precision denominator). With one
+    # relevant note per golden item, that formula caps precision at 1/20 = 0.05, so the metric
+    # could never clear its own 0.6 threshold no matter how good retrieval was — a guaranteed
+    # false failure. Observed exactly that: hit_rate 1.0 and MRR 0.875 (correct note at rank 1)
+    # alongside context_precision 0.0625.
+    #
+    # R-precision asks the meaningful question instead: of the top-R slots, how many hold a
+    # relevant note? For a single-target item it reduces to "was the right note ranked first?",
+    # which is what precision should mean for this eval.
+    r = len(relevant_paths)
+    top_r = retrieved[:r]
+    precision_count = sum(1 for p in top_r if any(_path_matches(p, ref) for ref in relevant_paths))
+    context_precision = (precision_count / len(top_r)) if top_r else 0.0
     return {
         "hit_rate": float(hit),
         "mrr": rr,
@@ -264,12 +334,20 @@ _ASPECT_DEFINITION = (
 
 
 def _coerce_score(v: Any) -> Optional[float]:
-    """ragas v0.4 returns ``MetricResult`` objects (``.value``); v0.3 returns floats."""
+    """ragas v0.4 returns ``MetricResult`` objects (``.value``); v0.3 returns floats.
+
+    ``NaN`` is treated as *absent*, not as a score. Ragas swallows per-row failures and writes
+    ``NaN`` into the cell, and a single such row would otherwise poison the whole column's mean
+    (``sum`` of anything with NaN is NaN), silently turning one bad row into a failed metric.
+    Returning ``None`` here drops that row from the average instead — the same treatment
+    :func:`_retrieval_paths` gives items with no ground-truth expectation.
+    """
     val = getattr(v, "value", v)
     try:
-        return float(val)
+        f = float(val)
     except (TypeError, ValueError):
         return None
+    return None if f != f else f  # NaN != NaN
 
 
 def _extract_ragas_scores(out: Any) -> Dict[str, float]:
@@ -357,10 +435,24 @@ def run() -> Dict[str, Any]:
     }
 
     # 2) Ragas — non-LLM + LLM metrics, each isolated.
+    #
+    # Negative items (no ``relevant_paths``; the vault genuinely cannot answer them) are excluded
+    # from the Ragas generation metrics. Their *correct* behaviour is a refusal — "I don't have
+    # enough in the vault to answer that" — which ResponseRelevancy scores 0.0 by design: it
+    # classifies refusals as noncommittal, and the non-LLM reference metrics have no
+    # reference_contexts to compare against (yielding NaN). Scoring a correct refusal as a
+    # generation failure measures the opposite of what we want and drags every mean down. The
+    # refusal behaviour is still asserted — that is what the negative items are *for* — it just
+    # belongs to the hallucination check, not to answer-quality scoring.
+    ragas_samples = [s for s in samples if s.get("relevant_paths")]
+    n_negative = len(samples) - len(ragas_samples)
+    if n_negative:
+        results["ragas_excluded_negative"] = n_negative
+
     try:
         from ragas import evaluate
 
-        dataset = _build_ragas_dataset(samples)
+        dataset = _build_ragas_dataset(ragas_samples)
         judge = _judge_llm()
         emb = _embeddings_wrapper()
 
@@ -414,6 +506,19 @@ def run() -> Dict[str, Any]:
                 results["skipped"].append(f"llm_run: {e}")
     except Exception as e:
         results["skipped"].append(f"ragas_import: {e}")
+
+    # 2b) Abstention on negative items — the check the Ragas exclusion above would otherwise
+    # drop. A negative item has no answer in the vault, so the *only* correct behaviour is to
+    # say so; inventing an answer is the hallucination failure this eval most needs to catch.
+    # Scored here as a first-class metric rather than left implicit.
+    negatives = [s for s in samples if not s.get("relevant_paths")]
+    if negatives:
+        abstained = sum(1 for s in negatives if _is_abstention(s["_answer"]))
+        results["abstention"] = {
+            "n": len(negatives),
+            "abstained": abstained,
+            "rate": abstained / len(negatives),
+        }
 
     # 3) Threshold pass/fail.
     # ``LLMContextRecall`` emits a column literally named ``context_recall`` — the same name our

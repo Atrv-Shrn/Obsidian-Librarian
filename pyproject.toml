@@ -64,6 +64,19 @@ dependencies = [
 evals = [
   "ragas>=0.4,<0.5",                 # code targets v0.4 API (EvaluationDataset/SingleTurnSample, MetricResult.value)
   "datasets>=2.20",
+  # ragas 0.4.x imports `langchain_community.chat_models.vertexai`, which was REMOVED in
+  # langchain-community 0.4. Installing the extra without this pin resolves to 0.4.x and every
+  # ragas import fails with ModuleNotFoundError — caught by rag_eval's try/except, so the run
+  # "succeeds" while silently reporting every Ragas metric as skipped. Pin below the break.
+  "langchain-community>=0.3,<0.4",
+  # Optional per-metric backends ragas does NOT declare, each guarded by a runtime check that
+  # only fires when the metric is constructed. Without them, NonLLMContextRecall and
+  # NonLLMContextPrecisionWithReference (rapidfuzz), BleuScore (sacrebleu), and RougeScore
+  # (rouge_score) all fail to build and are reported as skipped — i.e. four of the seven
+  # non-LLM metrics silently never run.
+  "rapidfuzz>=3.0",
+  "sacrebleu>=2.4",
+  "rouge-score>=0.1.2",
 ]
 dev = [
   "pytest>=8.2",
