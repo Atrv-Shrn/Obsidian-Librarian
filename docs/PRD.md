@@ -57,6 +57,39 @@ A personal AI librarian for Obsidian. Two halves in **one Docker container**:
 ## Current state
 
 - On branch `prototype` (work branch; `main` untouched).
+- **Two checkouts, and only one of them runs (recorded 2026-07-27).** Same repo, same branch,
+  same commit, but distinct roles:
+  - `C:\Users\athar\Documents\Obsidian-Librarian` — **the working/runtime checkout.** Holds the
+    real `.env` (+ `.env.bak.20260726`) and is the only place `docker compose` is ever run from;
+    the live container carries `com.docker.compose.project.working_dir` pointing here.
+  - `C:\Users\athar\Projects\Portfolio\Obsidian-Librarian` — **development only.** Never
+    `docker compose` this one.
+  A code fix is not live until it is copied into the runtime checkout **and** the image is
+  rebuilt there — editing the dev tree alone changes nothing that runs. Keep `src/`, `tests/`
+  and `docs/` in sync across both; `.dockerignore` excludes `tests/` and `docs/`, so only `src/`
+  affects the image, but a stale `tests/` in the runtime checkout will fail against fixed source.
+- **Demo vault rebuilt (2026-07-26).** The test vault at `C:\Users\athar\Documents\Obsidian-Test-Vault`
+  was wiped and rebuilt as a fictional company KB ("Kestrel", Series-B logistics analytics) for the
+  demo video. 70 notes across 13 folders; `.obsidian/` plugins + REST API key preserved; new
+  `graph.json` (per-folder colour groups) and `daily-notes.json` added; `workspace.json` deleted for a
+  clean pane layout. Planted props for 17 demo beats: 14 zero-wikilink orphan notes (detached graph
+  island for the "add wikilinks" money shot), SSO concept scattered under SAML/Okta/"enterprise
+  login"/"another password" with the literal `SSO` only in `RFC-003 Enterprise Single Sign-On` (so beat
+  #1 is only answerable semantically), 22 open `- [ ]` action items in Meetings/Daily, RFC-002/003/005/006
+  missing `status`/`owner` frontmatter (beat #7), `Onboarding - Week One` stub, no Security MOC, no
+  Kubernetes/cost-allocation mention (beat #6 abstention). Pristine snapshot at
+  `C:\Users\athar\Documents\Obsidian-Test-Vault-PRISTINE` (robocopy /MIR, outside the vault) for re-takes.
+  Verified all 14 prop checks pass. **Stack rebuilt and live (2026-07-26): image rebuilt after
+  `.env` change, `docker compose up -d`, `vault-sync` reported `+a=70 ~m=0 -d=0 dup=0 errs=0`,
+  `/health` ok. Read path verified with a beat #1 agent turn (`Which customers asked for SSO…`)
+  → cited answer spanning Customers/Product/Engineering-RFCs/Meetings. Langfuse trace
+  `agent-turn` confirmed landed end-to-end in cloud Langfuse (queried `/api/public/traces`,
+  3-min-old trace, beat #17 item closed). **Write path live:** `:27124` up (plugin v5.0.2),
+  `OBSIDIAN_API_KEY` in `.env` had drifted from the plugin's `data.json` key during a manual
+  `.env` edit — resynced from the plugin (authoritative side; backup `.env.bak.20260726`).
+  A `supervisorctl restart agent-api` is NOT sufficient after an `.env` change (it re-reads
+  only stale process env); `docker compose up -d` to recreate the container is required.
+  After recreate: `obsidian_writes:true`, agent lists `vault_write/append/patch/delete/move/copy`.**
 - **M0–M8 all implemented.** Full module tree under `src/obsidian_librarian/`:
   `config.py`, `cli.py`; `rag/{embeddings,reader,ingest,retrieve,query_engine}.py`,
   `rag/sync/{watermarks,scheduler}.py`; `mcp/rag_server.py`;
@@ -431,12 +464,95 @@ A personal AI librarian for Obsidian. Two halves in **one Docker container**:
     Langfuse scoring fix, which currently shows only "zero errors", not confirmed traces landing.
   - Suite 197 → **202 passing**.
 
+- **`docs/SPEC.md` regenerated as the v1.0.0 full spec (2026-07-25, branch `prototype`).** The old
+  file was the 2026-07-21 blueprint with partial reconciliation; it is replaced by a spec of the
+  system **as delivered** — verified against the tree, not the plan. Corrections it carries over the
+  old text: node ids are `uuid5(NAMESPACE_URL, "path::i")` not `sha1`; the stack table drops the
+  bundled-Ollama row (FastEmbed in-process); the container table lists the real **5** supervisord
+  programs; `/health` is documented as a real Qdrant+Redis probe returning 503; `recursion_limit` is
+  30 not 12; `get_backlinks` returns an authoritative `exists`; the graph section documents
+  `_repair_dangling_tool_calls` + `_reconcile_new_messages`; RAG-MCP contract, CLI, config keys,
+  `HOST_VAULT_PATH` vs `VAULT_PATH`, and loopback binding are all specified. Adds the measured
+  numbers (10/10 gates, 202 passed + 1 skipped of 203 collected, 15/15 stress scenarios, 1.09 GB
+  image) and an honest open-items list. Version label **v1.0.0** is the user's call; `pyproject.toml`
+  still reads `0.1.0` and was deliberately **not** bumped. The old spec text remains at `73992c6`;
+  the untracked `docs/SPEC-with-diff.md` (2026-07-24, pre-FastEmbed) is now superseded.
+
+- **First full day of real-world use — the assistant mostly did not answer. Root-caused and
+  fixed (2026-07-27, branch `prototype`).** User report: "it would just not respond", and when
+  it did, it answered questions from a different chat asked days earlier. All three symptoms
+  trace to **one defect chain**, reproduced live against the running container:
+  - `api/openai_compat.py` `_thread_id` keyed the conversation on the **content of the first
+    user message**. No chat client sends `X-Conversation-Id`, so the opener *was* the identity:
+    every chat beginning "hi" / "summarize this note" collided onto one thread.
+  - `agent/graph.py` `_reconcile_new_messages` then subtracted every resent message whose
+    `(type, content)` already existed in that thread's checkpoint. On a collision (or a simple
+    re-ask) **all** messages matched, so it returned `[]` and the graph was invoked with
+    `{"messages": []}` — replaying stale state, emitting no new content, and returning an
+    **empty HTTP 200**. The client renders nothing: "it ignores me". When the stale state did
+    speak, it continued the *older* conversation — the "answers from a different chat".
+  - Measured before the fix, 6 representative queries: **1 answered, 2 empty, 3 `[stream
+    error]`**. Proof case: the same question asked 3× on one thread answered on turn 1 and
+    returned empty on turns 2 and 3. After the fix: **6/6 answered**, 3/3 turns answered.
+  - Fixes: `_reconcile_new_messages` now reconciles only the history **prefix** — the final
+    message (by construction the turn the user just typed) is never dropped, making an empty
+    invocation structurally impossible; `_new_messages_for_turn` adds a backstop that sends the
+    full history rather than nothing; `_thread_id` hashes the **whole conversation** (role +
+    content, in order) so two chats collide only if identical message-for-message; the SSE
+    layer gained an `on_chat_model_end` fallback so a final answer that arrives without usable
+    token-stream events (or as content blocks) can't come out empty.
+  - Consequence, accepted: without a client-supplied `X-Conversation-Id` the thread id changes
+    as the conversation grows, so the checkpointer no longer carries state between turns. That
+    costs nothing — clients resend full history each turn and the HITL contract was always
+    designed to ride on it (see the locked decision above).
+  - Suite 202 → **209 passing** (+1 skipped). Three pre-existing tests were updated, not
+    patched around: two pinned the opener-only thread key and one asserted that a lone resent
+    message reconciles to `[]` — i.e. they encoded the bug as the contract.
+  - **Shipped to the runtime checkout.** Image rebuilt and `docker compose up -d` run from
+    `C:\Users\athar\Documents\Obsidian-Librarian` (see the two-checkout note below); fix verified
+    present in the container's installed package, 5/5 programs RUNNING, `/health` ok, and the
+    repeat-question and mixed-query probes re-run against the rebuilt image (3/3 and 6/6, zero
+    stream failures). The `librarian-data` volume survived the recreate, so no re-index was needed.
+  - **Diagnosis-only findings, not yet fixed** (see What's next): the API sends **zero
+    incremental output** (measured first-token == total elapsed, up to 33 s of silence, answer
+    arrives as one blob); DNS inside the container failed intermittently during the day
+    (8 of 99 turns died on `Name or service not known` reaching `ollama.com`), consistent with a
+    laptop changing networks/sleeping; and `/health` reported `obsidian_writes: true` for hours
+    after Obsidian became unreachable, because the toolset is cached at agent build time.
+
+- **`docs/SPEC.md` regenerated against the post-fix tree (2026-07-27, branch `prototype`).** Still
+  labelled v1.0.0 (`pyproject.toml` deliberately unbumped), `updated: 2026-07-27`. What changed vs
+  the 2026-07-25 spec: conversation identity is now documented as a hash of the **whole**
+  conversation with `X-Conversation-Id` precedence, plus the accepted consequence that the
+  checkpointer no longer carries state between turns; the graph section documents prefix-only
+  reconciliation and the `_new_messages_for_turn` backstop with a "never invoke the graph empty"
+  callout; the streaming contract documents the `on_chat_model_end` fallback and content-block
+  flattening, and carries an honest warning that there is **no incremental output**; `/health` is
+  described as probing Qdrant+Redis but reporting `obsidian_writes` from build-time cache; counts
+  corrected to **210 tests (209 passed, 1 skipped)** and **43** settings (was 44); Obsidian write
+  tools listed as create/patch/append/delete/**move/copy**; What's-next reordered by user-visible
+  pain (streaming → DNS retry → Obsidian re-probe → auth). Three new design-index rows (whole-
+  conversation thread id, per-turn id accepted over server-side continuity, prefix-only reconcile)
+  and a new "prefer a recoverable wrong over a silent nothing" principle. `docs/SPEC-with-diff.md`
+  remains untracked and superseded — safe to delete.
+
 ## What's next
 
 Personal daily use on a real vault is viable now: the stack runs, retrieval passes every gate,
 and the write path held under adversarial testing. The items below are what stand between that
 and handing the project to someone else.
 
+- **No incremental streaming — the biggest remaining "feels broken" factor.** `_stream_agent`
+  buffers the whole answer and emits it as a single SSE chunk at the end, so the client shows
+  nothing for the entire turn (measured 19 s, 26 s, 33 s on real queries). A user cannot tell
+  that from a hang, and any client-side idle timeout aborts the turn — invisible in our logs,
+  which record a clean 200. Options: stream the final run's tokens live (needs a way to know a
+  run is final), or emit periodic empty-delta keepalive chunks.
+- **Container DNS is fragile.** 8 of 99 logged turns failed with `Name or service not known` /
+  `Temporary failure in name resolution` reaching `ollama.com` — every one surfaced to the user
+  as `[stream error]`. Docker Desktop's embedded resolver going stale across host network
+  changes/sleep is the likely cause. Worth a retry-with-backoff around the LLM call so a
+  transient resolver blip doesn't kill a turn outright.
 - **Endpoint auth.** `:8000/v1` is unauthenticated and write-capable; CORS is the only gate, and
   it is an origin allowlist, not authentication. Fine behind loopback for personal use, **the
   blocker for anyone else running this.**
@@ -453,7 +569,13 @@ and handing the project to someone else.
 - **Agent caches its tool set at build time.** If Obsidian starts *after* the container, writes
   stay unavailable until `supervisorctl restart agent-api` — `_OBSIDIAN_AVAILABLE` is set once at
   first agent build and never re-probed. Cost us a confusing debug loop; a retry-on-demand or
-  periodic re-probe would remove the footgun.
+  periodic re-probe would remove the footgun. **Confirmed worse than cosmetic on 2026-07-27:**
+  `/health` advertised `obsidian_writes: true` for hours after `host.docker.internal:27124` had
+  become `Network is unreachable`, and because the Obsidian tools stayed bound in the toolset the
+  model kept calling them — each call opens a *fresh* session (`langchain_mcp_adapters`
+  `create_session` per invocation), so every one raised `ConnectError`, which `ToolNode`
+  re-raises and the SSE layer turns into a user-visible `[stream error]`. The probe belongs in
+  `/health` (and the toolset should be re-probed) rather than being read from build-time state.
 - **The agent doesn't know the date.** Written notes got `created: 2026-07-21` on 2026-07-25 —
   invented, not read from a clock. Wants a line in the skill file or an injected current date.
 - **Qdrant version skew.** Client 1.18.0 vs server 1.11.3 warns on every call. Works; worth

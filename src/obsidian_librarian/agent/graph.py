@@ -212,12 +212,27 @@ async def _reconcile_new_messages(agent, messages: list, thread_id: str) -> list
     failure is propagated, not swallowed: a fresh thread returns empty state and does NOT
     raise, so an exception here means the backend is broken — silently returning the full
     list would feed duplicates into a partially-checkpointed thread and corrupt it.
+
+    **The final message is never dropped.** In an OpenAI Chat Completions request the last
+    message is, by construction, the turn the user just typed. Subtracting it because its text
+    matched something already in the checkpoint is how this function used to silently swallow
+    an entire turn: re-ask a question (or open a new chat with a familiar first line, which the
+    content-derived thread id routed onto the *same* thread), and every resent message matched,
+    leaving ``[]`` to invoke the graph with. The agent then replayed a state that already ended
+    in an AI answer, produced no new content, and the API returned an empty 200 — the client
+    renders nothing and the assistant appears to ignore you. Reconciling only the *prefix*
+    makes that structurally impossible: whatever else happens, the agent sees what you just
+    sent. A genuine duplicate (the user really did re-ask the same thing) is the correct thing
+    to append anyway.
     """
     cfg = {"configurable": {"thread_id": thread_id}}
     state = await agent.aget_state(cfg)
     existing = list(state.values.get("messages", []))
-    if not existing:
+    if not existing or not messages:
         return messages
+
+    # Only the prefix is eligible for subtraction; the last message always passes through.
+    head, tail = messages[:-1], messages[-1:]
 
     from collections import Counter
 
@@ -237,14 +252,36 @@ async def _reconcile_new_messages(agent, messages: list, thread_id: str) -> list
     # Count existing messages by key so duplicates dedup one-for-one rather than all-or-none.
     remaining = Counter(key(m) for m in existing)
     out: list = []
-    for m in messages:
+    for m in head:
         k = key(m)
         if remaining.get(k, 0) > 0:
             remaining[k] -= 1  # already checkpointed → drop this resent copy
         else:
             out.append(m)
+    out.extend(tail)
     # Nothing dropped → return the original list object (identity preserved for callers/tests).
     return messages if len(out) == len(messages) else out
+
+
+async def _new_messages_for_turn(agent, messages: list, thread_id: str) -> list:
+    """Reconcile against the checkpoint, upholding "never invoke the graph with nothing".
+
+    ``_reconcile_new_messages`` already guarantees this by always passing the last message
+    through, so the fallback here should be unreachable. It stays as a structural backstop:
+    invoking the agent with an empty message list is the single failure mode that produces a
+    silent, empty, HTTP-200 answer — the graph replays stale state, emits no new content, and
+    the user sees the assistant ignore them. Whatever else goes wrong, we would rather send the
+    full history twice than send nothing.
+    """
+    new_msgs = await _reconcile_new_messages(agent, messages, thread_id)
+    if messages and not new_msgs:
+        log.warning(
+            "Reconciliation emptied a non-empty turn on thread %s; sending full history "
+            "instead of invoking the agent with nothing.",
+            thread_id,
+        )
+        return messages
+    return new_msgs
 
 
 async def _repair_dangling_tool_calls(agent, thread_id: str) -> int:
@@ -310,7 +347,7 @@ async def ainvoke(messages: list, thread_id: Optional[str] = None) -> dict:
     agent = await build_agent()
     tid = thread_id or get_settings().api_default_thread_id
     await _repair_dangling_tool_calls(agent, tid)
-    new_msgs = await _reconcile_new_messages(agent, messages, tid)
+    new_msgs = await _new_messages_for_turn(agent, messages, tid)
     config, handler = _invoke_config(thread_id)
     if handler is None:
         return await agent.ainvoke({"messages": new_msgs}, config=config)
@@ -346,7 +383,7 @@ async def astream(messages: list, thread_id: Optional[str] = None):
     agent = await build_agent()
     tid = thread_id or get_settings().api_default_thread_id
     await _repair_dangling_tool_calls(agent, tid)
-    new_msgs = await _reconcile_new_messages(agent, messages, tid)
+    new_msgs = await _new_messages_for_turn(agent, messages, tid)
     config = _invoke_config(thread_id)[0]
 
     client = get_langfuse_client() if langfuse_enabled() else None

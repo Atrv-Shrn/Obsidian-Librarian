@@ -105,13 +105,16 @@ def _req(messages, user=None):
     return ChatCompletionRequest(messages=messages, user=user)
 
 
-def test_thread_id_stable_for_same_opener_and_user():
+def test_thread_id_stable_for_same_conversation_and_user():
     msgs = [ChatMessage(role="user", content="Hello there"), ChatMessage(role="assistant", content="Hi")]
     a = _thread_id(_req(msgs, user="alice"))
     b = _thread_id(_req(msgs, user="alice"))
     assert a == b
-    # The full first user message is hashed (no truncation); short opener → key is exactly that.
-    assert a == hashlib.sha1("alice::Hello there".encode("utf-8")).hexdigest()[:16]
+    # The key is the WHOLE conversation (role + full content, in order), not just the opener.
+    # Keying on the opener alone collided unrelated chats onto one thread; see
+    # test_thread_id_distinguishes_conversations_sharing_an_opener.
+    key = "\x00".join(["alice", "user:Hello there", "assistant:Hi"])
+    assert a == hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
 def test_thread_id_differs_across_users_or_openers():
@@ -150,7 +153,7 @@ def test_thread_id_full_message_hash_distinguishes_long_shared_prefixes():
     b = _thread_id(_req([ChatMessage(role="user", content=long_b)], user="u"))
     assert a != b
     # Sanity: the full message (not the truncated prefix) drives the hash.
-    assert a == hashlib.sha1(f"u::{long_a}".encode("utf-8")).hexdigest()[:16]
+    assert a == hashlib.sha1(f"u\x00user:{long_a}".encode("utf-8")).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------- _sse_chunk
@@ -369,3 +372,34 @@ def test_thread_id_stable_with_content_parts():
         messages=[ChatMessage(role="user", content="hello world")]
     )
     assert _thread_id(req_list) == _thread_id(req_str)
+
+
+# ------------------------------------------- regression: cross-conversation thread collision
+
+
+def test_thread_id_distinguishes_conversations_sharing_an_opener():
+    """Two chats that open with the same line must not share a thread.
+
+    Keying the thread on the opening message alone meant "summarize this note" (or "hi") routed
+    every such chat onto one thread, so a new conversation loaded an old one's checkpoint —
+    surfacing as answers to questions asked days earlier in a different chat, and as empty
+    replies once reconciliation subtracted the whole resent history away.
+    """
+    shared = ChatMessage(role="user", content="summarize this note")
+    chat_a = _req([shared])
+    chat_b = _req([shared, ChatMessage(role="assistant", content="It's about priors."),
+                   ChatMessage(role="user", content="and posteriors?")])
+    assert _thread_id(chat_a) != _thread_id(chat_b)
+
+
+def test_thread_id_covers_whole_history_not_just_the_opener():
+    opener = ChatMessage(role="user", content="same start")
+    a = _req([opener, ChatMessage(role="user", content="question one")])
+    b = _req([opener, ChatMessage(role="user", content="question two")])
+    assert _thread_id(a) != _thread_id(b)
+
+
+def test_thread_id_identical_conversations_still_match():
+    # Identical message-for-message → same thread is harmless (and keeps retries idempotent).
+    msgs = [ChatMessage(role="user", content="hello"), ChatMessage(role="assistant", content="hi")]
+    assert _thread_id(_req(msgs)) == _thread_id(_req(list(msgs)))

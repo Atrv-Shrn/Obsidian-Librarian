@@ -179,21 +179,34 @@ def _thread_id(req: ChatCompletionRequest, conversation_id: Optional[str] = None
        which conversation this belongs to, so trust it. Two different conversations that happen
        to share an opening line must NOT collide, and an explicit id is the cleanest way to
        guarantee that.
-    2. Otherwise hash the **full** first user message + the optional ``user`` field. The whole
-       message is hashed (not just the first 200 chars) so a long note that shares its first 200
-       characters with a different note gets a distinct thread — a truncated hash would route
-       both to the same pending write and leak one into the other.
+    2. Otherwise hash the **whole conversation** — every message's role + content, in order,
+       plus the optional ``user`` field.
     3. Fall back to the configured default only when there is no user message at all.
 
-    Same conversation → same thread → pending write survives across turns.
+    Hashing the whole conversation rather than just its opening line is the point. The opener
+    alone is not an identity: two unrelated chats that both start "summarize this note" — or
+    "hi" — hashed to the *same* thread, so the second one loaded the first one's checkpoint and
+    answered out of a conversation the user had days earlier. Worse, every resent message then
+    matched that checkpoint and got subtracted away (see ``graph._reconcile_new_messages``),
+    leaving nothing to invoke the agent with and returning an empty 200. Two conversations now
+    collide only if they are identical message-for-message, in which case sharing a thread is
+    harmless because the content is the same.
+
+    Note the tradeoff: without a client-supplied ``X-Conversation-Id`` the id necessarily
+    changes as the conversation grows, so the checkpointer no longer carries state between
+    turns. That costs nothing here — chat clients resend the full history every turn, and the
+    propose-then-confirm HITL contract is explicitly designed to ride on that resent history
+    rather than on server-side state. A client that *does* send ``X-Conversation-Id`` gets a
+    genuinely stable thread.
     """
     s = get_settings()
     if conversation_id:
         return hashlib.sha1(f"conv::{conversation_id}".encode("utf-8")).hexdigest()[:16]
-    opener = _content_to_str(next((m.content for m in req.messages if m.role == "user"), ""))
-    if not opener:
+    if not any(m.role == "user" for m in req.messages):
         return s.api_default_thread_id
-    key = f"{req.user or ''}::{opener}"
+    parts = [req.user or ""]
+    parts.extend(f"{m.role}:{_content_to_str(m.content)}" for m in req.messages)
+    key = "\x00".join(parts)
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -323,6 +336,12 @@ async def _stream_agent(req: ChatCompletionRequest, model: str, cid: str, thread
     from langchain_core.messages import AIMessageChunk
 
     candidate: list[str] = []
+    # Fallback for the case where the final LLM run produces no usable *stream* events at all
+    # (a provider/version that doesn't emit ``on_chat_model_stream``, or emits only block-shaped
+    # content). ``on_chat_model_end`` carries the completed message either way, so we keep the
+    # last one and use it if the streamed buffer came out empty. Cleared on tool events exactly
+    # like ``candidate``, so an intermediate tool-calling run can never leak through it.
+    completed: str = ""
     current_run: Optional[str] = None
     try:
         # Convert inside the try: ``_stream_agent`` is an async generator, so this line only
@@ -339,9 +358,11 @@ async def _stream_agent(req: ChatCompletionRequest, model: str, cid: str, thread
                 if r != current_run:
                     current_run = r
                     candidate = []
+                    completed = ""
             elif kind in ("on_tool_start", "on_tool_end"):
                 # The preceding LLM run was a tool-calling turn — its prose is not the answer.
                 candidate = []
+                completed = ""
                 current_run = None
             elif kind == "on_chat_model_stream":
                 chunk = ev.get("data", {}).get("chunk")
@@ -350,8 +371,15 @@ async def _stream_agent(req: ChatCompletionRequest, model: str, cid: str, thread
                 # Skip chunks carrying tool-call payloads, not answer prose.
                 if getattr(chunk, "tool_call_chunks", None):
                     continue
-                if isinstance(chunk.content, str):
-                    candidate.append(chunk.content)
+                # ``content`` is a str for most providers but a list of typed blocks for some
+                # (and for reasoning models). Flattening rather than requiring ``str`` keeps a
+                # block-shaped final answer from being dropped into an empty response.
+                candidate.append(_content_to_str(chunk.content))
+            elif kind == "on_chat_model_end":
+                out = ev.get("data", {}).get("output")
+                text = _content_to_str(getattr(out, "content", None))
+                if text and not getattr(out, "tool_calls", None):
+                    completed = text
     except Exception:  # contain mid-stream failures — never leak internal text cross-origin
         log.exception("agent stream failed")
         yield _sse_chunk(model, content="[stream error]", cid=cid)
@@ -359,7 +387,7 @@ async def _stream_agent(req: ChatCompletionRequest, model: str, cid: str, thread
         yield "data: [DONE]\n\n"
         return
 
-    answer = "".join(candidate)
+    answer = "".join(candidate) or completed
     if answer:
         yield _sse_chunk(model, content=answer, cid=cid)
     yield _sse_chunk(model, finish="stop", cid=cid)

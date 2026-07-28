@@ -170,12 +170,14 @@ def test_reconcile_handles_list_content_in_checkpoint():
 
 def test_reconcile_list_content_message_dedups_against_itself():
     # Same list-content message on both sides must dedup one-for-one (stable repr key).
+    # It has to sit in the *prefix* to be eligible: the final message is never dropped, so a
+    # lone message can no longer reconcile to [] (that produced empty, silent answers).
     blocks = [{"type": "text", "text": "x"}]
     existing = [_Msg("ai", blocks)]
     agent = _FakeAgent(messages=existing)
-    msgs = [_Msg("ai", list(blocks))]  # equal-by-value list content
+    msgs = [_Msg("ai", list(blocks)), _Msg("human", "next")]  # equal-by-value list content
     out = _run(graph._reconcile_new_messages(agent, msgs, "t"))
-    assert out == []
+    assert [m.content for m in out] == ["next"]
 
 
 # --------------------------------------------------------------------------- poisoned checkpoint
@@ -234,3 +236,54 @@ def test_repair_multiple_dangling_calls_one_message_each():
     n = _run(graph._repair_dangling_tool_calls(agent, "t"))
     assert n == 1  # only 'b' was dangling
     assert agent.updates[0]["messages"][0].tool_call_id == "b"
+
+
+# ------------------------------------------------- regression: the silent-empty-answer bug
+
+
+def test_reconcile_never_drops_the_users_new_message():
+    """Re-asking a question must not subtract the whole turn away.
+
+    This is the defect that made the assistant appear to ignore the user: the thread id was
+    derived from message *content*, so a repeat question (or a new chat opening with a familiar
+    line) landed on a thread whose checkpoint already held every message being resent. All of
+    them matched, reconciliation returned ``[]``, the graph was invoked with nothing, replayed
+    stale state, emitted no new content, and the API returned an empty HTTP 200.
+    """
+    existing = [_Msg("human", "Name one note in my vault."), _Msg("ai", "Engineering/API Gateway.md")]
+    agent = _FakeAgent(messages=existing)
+    resent = [_Msg("human", "Name one note in my vault.")]  # user asks the same thing again
+    out = _run(graph._reconcile_new_messages(agent, resent, "t"))
+    assert [m.content for m in out] == ["Name one note in my vault."]
+
+
+def test_reconcile_keeps_final_message_even_when_whole_history_is_checkpointed():
+    existing = [_Msg("human", "a"), _Msg("ai", "b"), _Msg("human", "c")]
+    agent = _FakeAgent(messages=existing)
+    resent = [_Msg("human", "a"), _Msg("ai", "b"), _Msg("human", "c")]
+    out = _run(graph._reconcile_new_messages(agent, resent, "t"))
+    assert [m.content for m in out] == ["c"], "the turn the user just sent must survive"
+
+
+def test_new_messages_for_turn_never_invokes_the_graph_with_nothing():
+    """Backstop: a non-empty turn must never reconcile down to an empty invocation."""
+
+    async def _empty(agent, messages, thread_id):
+        return []
+
+    orig = graph._reconcile_new_messages
+    graph._reconcile_new_messages = _empty
+    try:
+        msgs = [_Msg("human", "hello?")]
+        out = _run(graph._new_messages_for_turn(_FakeAgent(messages=[]), msgs, "t"))
+        assert out is msgs
+    finally:
+        graph._reconcile_new_messages = orig
+
+
+def test_new_messages_for_turn_passes_reconciled_result_through():
+    existing = [_Msg("human", "a"), _Msg("ai", "b")]
+    agent = _FakeAgent(messages=existing)
+    resent = [_Msg("human", "a"), _Msg("ai", "b"), _Msg("human", "new")]
+    out = _run(graph._new_messages_for_turn(agent, resent, "t"))
+    assert [m.content for m in out] == ["new"]
