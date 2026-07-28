@@ -1,0 +1,25 @@
+# Force LF everywhere. This project's scripts and config are executed/parsed INSIDE a Linux
+# container, so a Windows CRLF checkout is not cosmetic — a CRLF entrypoint shebang becomes
+# `#!/usr/bin/env bash\r`, and the container dies at boot with:
+#   env: 'bash\r': No such file or directory
+# Without this file, a Windows clone (git core.autocrlf=true) converts on checkout and the
+# Docker build bakes the broken line endings into the image.
+* text=auto eol=lf
+
+# Belt-and-suspenders for the files Linux actually runs or parses.
+*.sh             text eol=lf
+*.py             text eol=lf
+*.conf           text eol=lf
+*.yml            text eol=lf
+*.yaml           text eol=lf
+*.jsonl          text eol=lf
+*.toml           text eol=lf
+Dockerfile       text eol=lf
+Makefile         text eol=lf
+entrypoint.sh    text eol=lf
+supervisord.conf text eol=lf
+
+# Real binaries (future-proofing; none tracked today) must never be normalized.
+*.png  binary
+*.jpg  binary
+*.onnx binary

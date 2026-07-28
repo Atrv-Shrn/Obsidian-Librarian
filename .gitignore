@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+# Also ignore .env backups/variants — these carry live API keys and are easy to
+# create accidentally (e.g. `cp .env .env.bak` before an edit). A bare `.env`
+# rule does NOT cover them.
+.env.*
+!.env.example
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Local state / secrets
+/data/
+/sample_vault/.trash/
+
+# Editor / OS / agent tooling
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+
+# Internal docs (spec, PRD) stay local
+docs/
+
+# Never ignore the sample vault seed
+!sample_vault/

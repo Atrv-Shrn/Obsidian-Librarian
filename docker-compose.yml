@@ -1,0 +1,53 @@
+services:
+  librarian:
+    build: .
+    image: obsidian-librarian:latest
+    container_name: obsidian-librarian
+    ports:
+      # Bound to 127.0.0.1 on the HOST, not 0.0.0.0. The endpoint is unauthenticated and
+      # write-capable (16 Obsidian write tools), so a plain "8000:8000" publishes vault
+      # read/write to every device on your network — and to the internet if the port is ever
+      # forwarded or the container runs on a VPS. CORS does not help here: it is a browser
+      # mechanism, and curl or any script ignores it entirely.
+      #
+      # Loopback binding still works for the normal setup — Obsidian, Open WebUI and Copilot
+      # all connect over localhost. Change this only if you deliberately want remote access,
+      # and put authentication in front of it first.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # HOST path of your vault → the container's /vault. Deliberately NOT named
+      # VAULT_PATH: that name is the *container-internal* mount point (see .env.example
+      # / config.py), and reusing it here made a copied .env resolve the host source to
+      # the literal "/vault" — an empty dir, so nothing indexed and every answer came
+      # back "not in the vault".
+      - ${HOST_VAULT_PATH:-./sample_vault}:/vault
+      - librarian-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Load the WHOLE .env into the container so every setting config.py understands actually
+    # takes effect. Without this, only the vars explicitly listed under `environment:` below
+    # reached the app, so e.g. RECURSION_LIMIT / CHUNK_SIZE / RERANK_TOP_K set in .env were
+    # silently ignored (the image doesn't ship .env — it's .dockerignore'd). `required: false`
+    # keeps the no-.env sample_vault flow working. The `environment:` block stays for graceful
+    # defaults when a var is absent from .env.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-https://ollama.com}
+      GENERATION_MODEL: ${GENERATION_MODEL:-deepseek-v4-pro:cloud}
+      JUDGE_MODEL: ${JUDGE_MODEL:-glm-5.2:cloud}
+      OBSIDIAN_MCP_URL: ${OBSIDIAN_MCP_URL:-https://host.docker.internal:27124/mcp/}
+      OBSIDIAN_API_KEY: ${OBSIDIAN_API_KEY}
+      OBSIDIAN_TLS_INSECURE: ${OBSIDIAN_TLS_INSECURE:-true}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-15}
+      WRITE_CONFIRM: ${WRITE_CONFIRM:-true}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-}
+    restart: unless-stopped
+
+volumes:
+  librarian-data:

@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "obsidian-librarian"
+version = "0.1.0"
+description = "A personal AI librarian for your Obsidian vault — read-only RAG pipeline + LangGraph agent, one Docker container."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Atrv-Shrn" }]
+
+dependencies = [
+  # --- config / utils ---
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "python-dotenv>=1.0",
+  "httpx>=0.27",
+
+  # --- RAG pipeline (LlamaIndex) ---
+  "llama-index-core>=0.11",
+  "llama-index-readers-obsidian>=0.2",
+  "qdrant-client>=1.11",
+  "redis>=5.0",
+  "fastembed>=0.3",                 # BM25 sparse + cross-encoder rerank (in-process ONNX)
+
+  # --- Agent (LangGraph + LangChain) ---
+  "langgraph>=0.2",
+  "langgraph-checkpoint-sqlite>=2.0",
+  "aiosqlite>=0.20",                # AsyncSqliteSaver's async connection (agent checkpointer)
+  "langchain>=0.3",
+  "langchain-core>=0.3",
+  "langchain-ollama>=0.3",          # ChatOllama → Ollama Cloud (SPEC "organs": Voice = ChatOllama)
+  "langchain-mcp-adapters>=0.2",    # MultiServerMCPClient + streamable-http; 0.2+ stable API
+
+  # --- MCP (RAG-MCP read server) ---
+  "fastmcp>=0.3",
+  "mcp>=1.2",
+
+  # --- API (Seam 2) ---
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+
+  # --- Scheduler ---
+  "apscheduler>=3.10",
+
+  # --- Evals ---
+  # NOTE: ragas + datasets are NOT here — they live in the `evals` extra below. They pull
+  # ~500 MB (pyarrow, pandas, scikit-network, langchain-community, openai, nltk) that the
+  # serving container never imports. langfuse stays: the agent traces at runtime.
+  "langfuse>=3,<4",                  # observability.py is v3-first (client-side creds) with a v2 fallback
+
+  # --- CLI ---
+  "rich>=13.7",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+# Ragas-based RAG evaluation (M8, Part A). Split out of the runtime deps because it is the
+# single biggest contributor to image size and is only needed when you actually run
+# `librarian eval` / `make eval-rag`. Without it, rag_eval still runs and reports the
+# retrieval metrics, listing the ragas families under "skipped".
+evals = [
+  "ragas>=0.4,<0.5",                 # code targets v0.4 API (EvaluationDataset/SingleTurnSample, MetricResult.value)
+  "datasets>=2.20",
+  # ragas 0.4.x imports `langchain_community.chat_models.vertexai`, which was REMOVED in
+  # langchain-community 0.4. Installing the extra without this pin resolves to 0.4.x and every
+  # ragas import fails with ModuleNotFoundError — caught by rag_eval's try/except, so the run
+  # "succeeds" while silently reporting every Ragas metric as skipped. Pin below the break.
+  "langchain-community>=0.3,<0.4",
+  # Optional per-metric backends ragas does NOT declare, each guarded by a runtime check that
+  # only fires when the metric is constructed. Without them, NonLLMContextRecall and
+  # NonLLMContextPrecisionWithReference (rapidfuzz), BleuScore (sacrebleu), and RougeScore
+  # (rouge_score) all fail to build and are reported as skipped — i.e. four of the seven
+  # non-LLM metrics silently never run.
+  "rapidfuzz>=3.0",
+  "sacrebleu>=2.4",
+  "rouge-score>=0.1.2",
+]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+librarian = "obsidian_librarian.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"obsidian_librarian.agent.skills" = ["*.md"]
+"obsidian_librarian.evals" = ["*.jsonl"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
