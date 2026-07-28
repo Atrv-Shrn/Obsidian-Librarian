@@ -28,6 +28,8 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Never ignore the spec / docs / sample vault seed
-!docs/
+# Internal docs (spec, PRD) stay local
+docs/
+
+# Never ignore the sample vault seed
 !sample_vault/

@@ -4,7 +4,7 @@
 
 > Ask it anything about your notes and it answers from the actual files, with clickable `[[wikilink]]` citations. Ask it to *do* something and it shows you the change first, waits for your "yes", then makes it.
 
-[![Obsidian-Librarian demo](docs/demo.gif)](docs/demo.mp4)
+[![Obsidian-Librarian demo](assets/demo.gif)](assets/demo.mp4)
 
 <sub>Click through for the full-quality recording with audio.</sub>
 
@@ -160,7 +160,7 @@ MIT, see [`LICENSE`](LICENSE).
 
 # Technical detail
 
-Everything above is the short version. This is the rest of it. The complete architecture, with every design decision and the reasoning behind each one, lives in [`docs/SPEC.md`](docs/SPEC.md).
+Everything above is the short version. This is the rest of it.
 
 ## What's inside the container
 
